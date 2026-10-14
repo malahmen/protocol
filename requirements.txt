@@ -1,0 +1,6 @@
+# The API process. Pinned to protocol-droid's versions (resolvable on PyPI as of
+# 2026-09-10, python 3.12). The backends' clients - MariaDB, Garage (S3), RQ and
+# Redis, Qdrant - arrive with their adapters (Kamino TODO items 21-23).
+fastapi==0.141.1
+uvicorn[standard]==0.52.4
+python-multipart==0.0.32

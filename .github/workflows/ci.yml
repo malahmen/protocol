@@ -1,0 +1,36 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Syntax of every module
+        # Globbed, not listed: a named list quietly stops covering the next
+        # module somebody adds.
+        run: python3 -m compileall -q protocol tests
+
+      - name: tests, stdlib only
+        # The contract's suite needs nothing installed; the HTTP tests skip.
+        # Run first so a stray third-party import in the core fails here.
+        run: python3 -m unittest discover -s tests -v
+
+      - name: install
+        run: python3 -m pip install -r requirements-dev.txt
+
+      - name: tests, with the HTTP layer
+        run: python3 -m unittest discover -s tests -v

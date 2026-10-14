@@ -1,0 +1,3 @@
+-r requirements.txt
+# FastAPI's test client; starlette 1.8 deprecates plain httpx in its favour.
+httpx2==2.13.1
