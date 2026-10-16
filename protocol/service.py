@@ -26,6 +26,7 @@ import uuid
 from typing import Optional
 
 from . import contract as c
+from . import cost
 from . import routing
 from .config import Settings
 from .ports import Converter, EventStream, JobQueue, ObjectStore, Registry, VectorIndex
@@ -86,12 +87,22 @@ class ConversionService:
 
     # --- requests ------------------------------------------------------------
 
-    def _admit(self, converter: str) -> str:
+    def _plan(self, converter: str, name: str, data: Optional[bytes],
+              options: dict) -> tuple[str, int]:
+        """The queue a conversion waits in and how long it may run (cost.py).
+
+        Worked out from the source and the options alone, so a retry, which
+        has both, lands back in the lane its first attempt was given.
+        """
+        est = cost.estimate(converter, name, data, options)
+        s = self.settings
+        return (cost.queue(converter, est, s.marker_heavy_seconds),
+                cost.timeout(est, s.job_timeout_base, s.job_timeout_per_page, s.job_timeout_unknown))
+
+    def _admit(self, queue: str) -> None:
         """Backpressure: refuse new work for a queue that is already full."""
-        queue = routing.queue_for(converter)
         if self.queue.depth(queue) >= self.settings.queue_max_depth:
             raise Busy(f"queue {queue} is full")
-        return queue
 
     def submit(self, data: bytes, original_name: str, media_type: str = "application/octet-stream",
                converter: str = routing.AUTO, options: Optional[dict] = None,
@@ -112,7 +123,8 @@ class ConversionService:
         existing = self.registry.find_live_by_hash(content_hash)
         if existing:
             return existing, None, False
-        queue = self._admit(chosen)
+        queue, timeout = self._plan(chosen, name, data, opts)
+        self._admit(queue)
 
         # The source is stored before the registry row exists, so a row never
         # points at a missing source. Losing the insert race to an identical
@@ -131,7 +143,8 @@ class ConversionService:
         conv = c.Conversion(conversion_id=new_id(), document_id=document_id, mode=c.INITIAL,
                             converter=chosen, options=opts)
         self.registry.add_conversion(conv)
-        self.queue.enqueue(queue, {"kind": "convert", "conversion_id": conv.conversion_id})
+        self.queue.enqueue(queue, {"kind": "convert", "conversion_id": conv.conversion_id},
+                           timeout_seconds=timeout)
         return stored, conv, True
 
     def status(self, document_id: str) -> tuple[c.Document, list[c.Conversion]]:
@@ -155,11 +168,15 @@ class ConversionService:
             raise InvalidRequest("mode must be one of " + ", ".join(c.MODES))
         chosen = routing.choose(doc.original_name, converter)
         opts = routing.validate_options(chosen, options, self.settings)
-        queue = self._admit(chosen)
+        # Only marker's cost depends on the source, so only marker reads it here.
+        data = self.store.get(doc.source_key) if chosen == "marker" else None
+        queue, timeout = self._plan(chosen, doc.original_name, data, opts)
+        self._admit(queue)
         conv = c.Conversion(conversion_id=new_id(), document_id=document_id, mode=mode,
                             converter=chosen, options=opts)
         self.registry.add_conversion(conv)
-        self.queue.enqueue(queue, {"kind": "convert", "conversion_id": conv.conversion_id})
+        self.queue.enqueue(queue, {"kind": "convert", "conversion_id": conv.conversion_id},
+                           timeout_seconds=timeout)
         return conv
 
     def remove(self, document_id: str) -> c.Document:
@@ -201,9 +218,11 @@ class ConversionService:
             doc.state = c.CONVERTING
             self.registry.save_document(doc)
 
+        data = None
         try:
             converter = self.converters[conv.converter]
-            result = converter.convert(self.store.get(doc.source_key), doc.original_name, conv.options)
+            data = self.store.get(doc.source_key)
+            result = converter.convert(data, doc.original_name, conv.options)
             self.store.delete_prefix(prefix)   # at-least-once: clear an earlier attempt
             for name, content in result.files.items():
                 self.store.put(prefix + _safe_relative(name), content)
@@ -215,8 +234,9 @@ class ConversionService:
                 conv.error = reason
                 self.registry.save_conversion(conv)
                 delay = self.settings.retry_base_seconds * 2 ** (conv.attempts - 1)
-                self.queue.enqueue(routing.queue_for(conv.converter),
-                                   {"kind": "convert", "conversion_id": conv.conversion_id}, delay)
+                queue, timeout = self._plan(conv.converter, doc.original_name, data, conv.options)
+                self.queue.enqueue(queue, {"kind": "convert", "conversion_id": conv.conversion_id},
+                                   delay, timeout_seconds=timeout)
             else:
                 self._fail(conv, doc, reason)
             return

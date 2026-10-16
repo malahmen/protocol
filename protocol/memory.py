@@ -99,16 +99,18 @@ class Store:
 
 
 class Queue:
-    """FIFO per queue name. `delay_seconds` is recorded, not waited on."""
+    """FIFO per queue name. `delay_seconds` and `timeout_seconds` are recorded,
+    not acted on."""
 
     def __init__(self):
         self._lock = threading.Lock()
-        self.jobs: dict[str, list[tuple[dict, int]]] = {}
+        self.jobs: dict[str, list[tuple[dict, int, Optional[int]]]] = {}
         self.dead: list[tuple[str, dict, str]] = []
 
-    def enqueue(self, queue: str, job: dict, delay_seconds: int = 0) -> None:
+    def enqueue(self, queue: str, job: dict, delay_seconds: int = 0,
+                timeout_seconds: Optional[int] = None) -> None:
         with self._lock:
-            self.jobs.setdefault(queue, []).append((dict(job), delay_seconds))
+            self.jobs.setdefault(queue, []).append((dict(job), delay_seconds, timeout_seconds))
 
     def depth(self, queue: str) -> int:
         with self._lock:

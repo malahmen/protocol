@@ -34,3 +34,34 @@ jobs:
 
       - name: tests, with the HTTP layer
         run: python3 -m unittest discover -s tests -v
+
+  redis:
+    # The queue, the completion stream and the guarded worker against a real
+    # Redis 7 - the major meksha runs (kuat's redis_version). The suite flushes
+    # the database it is given, so it gets this throwaway one and nothing else;
+    # without PROTOCOL_TEST_REDIS_URL those checks skip.
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 2s
+          --health-timeout 2s
+          --health-retries 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: install
+        run: python3 -m pip install -r requirements-dev.txt
+
+      - name: tests, with Redis
+        env:
+          PROTOCOL_TEST_REDIS_URL: redis://localhost:6379/15
+        run: python3 -m unittest discover -s tests -v

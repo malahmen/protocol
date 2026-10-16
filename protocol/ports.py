@@ -2,16 +2,17 @@
 
 Each interface is the narrow slice of a real backend the contract uses:
 
-| Port         | Real backend (planned)                       | Today            |
-| ------------ | -------------------------------------------- | ---------------- |
-| Registry     | MariaDB on meksha (decision 17)              | memory.Registry  |
-| ObjectStore  | Garage on taris: `sources`, `outputs`        | memory.Store     |
-| JobQueue     | RQ on meksha's Redis, one queue per converter| memory.Queue     |
-| EventStream  | Redis Stream `conversions.events`            | memory.Events    |
-| VectorIndex  | Qdrant, points filtered by document_id       | memory.Index     |
-| Converter    | marker, markitdown, Speaches (transcription) | tests' fakes     |
+| Port         | Real backend                                 | Adapter                         |
+| ------------ | -------------------------------------------- | ------------------------------- |
+| Registry     | MariaDB on meksha (decision 17)              | to come                         |
+| ObjectStore  | Garage on taris: `sources`, `outputs`        | to come                         |
+| JobQueue     | RQ on meksha's Redis, one queue per converter| redis_backends.RQJobQueue       |
+| EventStream  | Redis Stream `conversions.events`            | redis_backends.RedisStream      |
+| VectorIndex  | Qdrant, points filtered by document_id       | to come                         |
+| Converter    | marker, markitdown, Speaches (transcription) | converters.EngineConverter (marker, markitdown) |
 
-The real adapters wait on TODO items 21 and 22 (Kamino `review-2026-10-10.md`).
+memory.py has every port, for the tests and the development server. The
+remaining adapters are Kamino `todo.md` item 69.
 Keeping the contract behind these ports is what lets it be written and tested
 before any of them exists.
 """
@@ -59,7 +60,11 @@ class JobQueue(Protocol):
     name a kind and an ID; the worker maps the kind to a handler it already has.
     """
 
-    def enqueue(self, queue: str, job: dict, delay_seconds: int = 0) -> None: ...
+    def enqueue(self, queue: str, job: dict, delay_seconds: int = 0,
+                timeout_seconds: Optional[int] = None) -> None:
+        """`timeout_seconds`: how long the job may run once started; None = the
+        backend's default. Sized per job from its estimated cost (cost.py)."""
+        ...
     def depth(self, queue: str) -> int: ...
     def dead_letter(self, queue: str, job: dict, reason: str) -> None: ...
 

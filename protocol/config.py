@@ -9,6 +9,10 @@
 | `PAGE_RANGE_MAX_PAGES`         | 2000         | most pages one marker page_range may cover           |
 | `PAGE_RANGE_MAX_INDEX`         | 100000       | highest page a marker page_range may name            |
 | `LLM_SERVICE`                  | unset        | set = marker's `use_llm` is allowed (the endpoint is the worker's configuration) |
+| `PROTOCOL_MARKER_HEAVY_SECONDS`| 300          | a marker job estimated longer than this waits in the heavy lane (cost.py) |
+| `PROTOCOL_JOB_TIMEOUT_BASE`    | 1800         | every job's allowance before its pages                |
+| `PROTOCOL_JOB_TIMEOUT_PER_PAGE`| 180          | per page: ~3x OCR's measured 54.7 s/page              |
+| `PROTOCOL_JOB_TIMEOUT_UNKNOWN` | 21600        | a job whose page count cannot be known (6 h)          |
 """
 import os
 from dataclasses import dataclass
@@ -36,6 +40,10 @@ class Settings:
     page_range_max_pages: int = 2000
     page_range_max_index: int = 100000
     llm_configured: bool = False
+    marker_heavy_seconds: int = 300
+    job_timeout_base: int = 1800
+    job_timeout_per_page: int = 180
+    job_timeout_unknown: int = 21600
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -47,4 +55,8 @@ class Settings:
             page_range_max_pages=_int("PAGE_RANGE_MAX_PAGES", cls.page_range_max_pages),
             page_range_max_index=_int("PAGE_RANGE_MAX_INDEX", cls.page_range_max_index),
             llm_configured=bool(os.environ.get("LLM_SERVICE", "").strip()),
+            marker_heavy_seconds=_int("PROTOCOL_MARKER_HEAVY_SECONDS", cls.marker_heavy_seconds),
+            job_timeout_base=_int("PROTOCOL_JOB_TIMEOUT_BASE", cls.job_timeout_base),
+            job_timeout_per_page=_int("PROTOCOL_JOB_TIMEOUT_PER_PAGE", cls.job_timeout_per_page),
+            job_timeout_unknown=_int("PROTOCOL_JOB_TIMEOUT_UNKNOWN", cls.job_timeout_unknown),
         )
