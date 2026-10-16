@@ -8,7 +8,7 @@ Nothing waits on a conversion, and nothing is lost unless you ask for it.
 
 - **Non-blocking.** Every request answers `202 Accepted` and an ID. The work is queued; the result is announced on a completion stream.
 - **Nothing is lost.** The source is kept from intake until you remove it. Every conversion keeps its own output folder, its provenance and its registry row.
-- **One door, many converters.** marker, markitdown and transcription sit behind the same endpoints, each with **its own queue**, so a quick job never waits behind a slow one.
+- **One door, many converters.** marker, markitdown and transcription sit behind the same endpoints, each with **its own queue**, so a quick job never waits behind a slow one. marker's queue is itself split in two by expected cost: a 3-page text PDF converts in half a second and a 166-page scan in 2.5 hours, so each estimated job goes to a light or a heavy lane with its own worker (`protocol/cost.py`).
 
 The specification is Kamino's `converter-services-2026-10-10.md` - "The non-blocking contract" and decisions 10-18. This repository implements it; where the two disagree, the report wins and this is a bug.
 
@@ -31,6 +31,24 @@ The contract is built and tested. The backends it runs on are not, yet.
 | Install and management on corelia | a scomp-link script, `protocol/protocol.sh` - TODO item 23 |
 
 TODO items are in Kamino's `review-2026-10-10.md`, "Planned work".
+
+---
+
+## Marker's two lanes
+
+Before a marker job is queued, `protocol/cost.py` estimates how long it will run, from the PDF's page count (cut to `page_range`) and whether it needs OCR - no text layer, an image, or `force_ocr` - at the rates measured on corelia (54.7 s/page with OCR, ~3.2 without; marker 2.0.0, 32 CPUs, no GPU):
+
+| Document | Pages | OCR | Estimate | Lane |
+| --- | ---: | --- | ---: | --- |
+| a CLI cheat sheet | 3 | no | 10 s | light |
+| a monitor manual, with tables | 30 | no | 96 s | light |
+| a scanned pamphlet | 22 | yes | 20 min | heavy |
+| a scanned book | 166 | yes | 2.5 h | heavy |
+| a 387-page text book | 387 | no | 21 min | heavy |
+
+Over `PROTOCOL_MARKER_HEAVY_SECONDS` (five minutes) it waits in `convert.marker.heavy`, otherwise in `convert.marker.light`, each with its own worker - more workers on one CPU host would only share its threads. **Anything whose cost cannot be read counts as heavy**: the light lane's promise is that nothing slow is in it. The same estimate sizes the job's timeout, and a retry is planned again from the same source, so it returns to its lane.
+
+Reading a PDF's facts takes a few milliseconds and needs `pypdfium2` (in `requirements.txt`); the core runs without it, and then every PDF is an unknown cost.
 
 ---
 
@@ -154,6 +172,10 @@ Removal runs **index, then outputs, then source**, so a removal that stops halfw
 | `PAGE_RANGE_MAX_PAGES` | `2000` | most pages one marker `page_range` may cover |
 | `PAGE_RANGE_MAX_INDEX` | `100000` | highest page a marker `page_range` may name |
 | `LLM_SERVICE` | unset | set: marker's `use_llm` is allowed |
+| `PROTOCOL_MARKER_HEAVY_SECONDS` | `300` | a marker job estimated longer than this waits in the heavy lane |
+| `PROTOCOL_JOB_TIMEOUT_BASE` | `1800` | every job's allowance before its pages |
+| `PROTOCOL_JOB_TIMEOUT_PER_PAGE` | `180` | per page: ~3x OCR's measured 54.7 s/page |
+| `PROTOCOL_JOB_TIMEOUT_UNKNOWN` | `21600` | a job whose page count cannot be known (6 h) |
 
 The backends' settings (MariaDB, Garage, Redis, Qdrant, Speaches) arrive with their adapters.
 

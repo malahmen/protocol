@@ -24,6 +24,13 @@ QUEUES = {
 }
 CONVERTERS = tuple(QUEUES)
 
+# marker's work is split by expected cost (Kamino item 73; protocol/cost.py):
+# two lanes, each with its own worker, so a small document never waits behind
+# a book. "convert.marker" stays marker's name - its dead letters are kept
+# under it - but no job waits in it.
+MARKER_LIGHT_QUEUE = "convert.marker.light"
+MARKER_HEAVY_QUEUE = "convert.marker.heavy"
+
 # Removal and prune touch only the registry, the stores and the index: they
 # share one light queue rather than waiting behind a conversion.
 MAINTENANCE_QUEUE = "maintenance"
@@ -59,7 +66,15 @@ def choose(original_name: str, requested: str = AUTO) -> str:
 
 
 def queue_for(converter: str) -> str:
+    """The converter's queue name; for marker, the family its two lanes share."""
     return QUEUES[converter]
+
+
+def worker_queues(converter: str) -> tuple[str, ...]:
+    """The queues a worker for this converter consumes, most urgent first."""
+    if converter == "marker":
+        return (MARKER_LIGHT_QUEUE, MARKER_HEAVY_QUEUE)
+    return (QUEUES[converter],)
 
 
 def validate_page_range(spec, max_pages: int, max_index: int) -> str:

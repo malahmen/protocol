@@ -4,3 +4,8 @@
 fastapi==0.141.1
 uvicorn[standard]==0.52.4
 python-multipart==0.0.32
+# Reads a PDF's page count and whether it has a text layer, to estimate a
+# marker job's cost before it is queued (cost.py, Kamino item 73). The same
+# version marker's image carries; a 3.7 MB wheel, no torch. Optional to the
+# core: without it every PDF is an unknown cost, so the heavy lane.
+pypdfium2==5.10.1

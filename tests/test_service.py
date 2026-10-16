@@ -37,7 +37,9 @@ class SubmitTest(Base):
         self.assertEqual(self.store.get(doc.source_key), PDF)
         self.assertEqual(doc.source_key, f"sources/{doc.document_id}/report.pdf")
         self.assertEqual(conv.mode, c.INITIAL)
-        self.assertEqual(self.queue.depth("convert.marker"), 1)
+        # PDF is placeholder bytes nothing can read: an unknown cost, so the
+        # heavy lane (cost.py; test_cost.py covers the choice itself).
+        self.assertEqual(self.queue.depth(routing.MARKER_HEAVY_QUEUE), 1)
 
     def test_audio_is_queued_for_transcription(self):
         self.service.submit(b"RIFF", "meeting.wav")
@@ -49,7 +51,7 @@ class SubmitTest(Base):
         self.assertFalse(created)
         self.assertIsNone(conv)
         self.assertEqual(again.document_id, first.document_id)
-        self.assertEqual(self.queue.depth("convert.marker"), 1)
+        self.assertEqual(self.queue.depth(routing.MARKER_HEAVY_QUEUE), 1)
 
     def test_losing_the_insert_race_leaves_no_orphan_source(self):
         # Another submission of the same bytes registered between the hash
@@ -130,8 +132,8 @@ class ConversionTest(Base):
         service, parts, _ = helpers.build(marker=helpers.FakeConverter("marker", fail_times=2))
         doc, conv, _ = service.submit(PDF, "a.pdf")
         delays = []
-        while (pending := parts["queue"].jobs.get("convert.marker")):
-            job, delay = pending.pop(0)
+        while (pending := parts["queue"].jobs.get(routing.MARKER_HEAVY_QUEUE)):
+            job, delay, _timeout = pending.pop(0)
             delays.append(delay)
             handle(service, job)
         self.assertEqual(delays, [0, 30, 60])
