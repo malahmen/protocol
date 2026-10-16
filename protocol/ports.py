@@ -12,7 +12,7 @@ Each interface is the narrow slice of a real backend the contract uses:
 | Converter    | marker, markitdown, Speaches (transcription) | converters.EngineConverter (marker, markitdown) |
 
 memory.py has every port, for the tests and the development server. The
-remaining adapters are Kamino `review-2026-10-10.md` item 69.
+remaining adapters are Kamino `todo.md` item 69.
 Keeping the contract behind these ports is what lets it be written and tested
 before any of them exists.
 """

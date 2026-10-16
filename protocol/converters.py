@@ -14,7 +14,7 @@ started in the wrong image fails its first job with a message that says so,
 rather than at import.
 
 Transcription is not here: it calls Speaches over HTTP and arrives with its
-own adapter (Kamino items 20 and 68).
+own adapter (Kamino item 68).
 """
 import importlib
 from typing import Optional

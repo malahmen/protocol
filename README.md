@@ -16,21 +16,21 @@ The specification is Kamino's `converter-services-2026-10-10.md` - "The non-bloc
 
 ## Status
 
-The contract is built and tested. The backends it runs on are not, yet.
+The contract is built and tested, and so are the converters and the queue. The stores and the registry are next.
 
 | Part | State |
 | --- | --- |
 | The contract: submit, status, reconvert, remove, prune, and the worker jobs behind them | **built** |
 | The HTTP API (FastAPI) | **built** |
 | In-memory backends and a development server | **built**: try the API with curl today |
-| Registry on MariaDB (meksha) | waits on TODO item 22 |
-| Source and output stores on Garage (taris) | waits on TODO item 22 |
+| Registry on MariaDB (meksha) | the adapter: item 69, after Garage and Qdrant; the database and its user on meksha: item 22 |
+| Source and output stores on Garage (taris) | the adapter: item 69, next; the two buckets on taris: item 22 |
 | Queues (RQ) and the completion stream (Redis Stream), on meksha's Redis | **built** (`protocol/redis_backends.py`): JSON jobs, one job function, a worker that refuses any other |
-| Qdrant removal by document | waits on TODO item 23 |
-| The converters: marker and markitdown, in protocol-droid's two images (`protocol/converters.py`) | **built**; transcription through Speaches waits on TODO items 20 and 68 |
-| Install and management on corelia | a scomp-link script, `protocol/protocol.sh` - TODO item 23 |
+| Qdrant removal by document | the adapter: item 69 |
+| The converters: marker and markitdown, in protocol-droid's two images (`protocol/converters.py`) | **built**; transcription through Speaches waits on item 68 (running Speaches on corelia, and measuring it) |
+| Install and management on corelia | a scomp-link script, `protocol/protocol.sh`: item 70 |
 
-TODO items are in Kamino's `review-2026-10-10.md`, "Planned work".
+Item numbers are Kamino's `todo.md` (private), the to-do list for every project.
 
 ---
 
