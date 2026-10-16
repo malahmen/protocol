@@ -20,14 +20,14 @@ The contract is built and tested. The backends it runs on are not, yet.
 
 | Part | State |
 | --- | --- |
-| The contract: submit, status, reconvert, remove, prune, and the worker jobs behind them | **built**, 50 tests |
+| The contract: submit, status, reconvert, remove, prune, and the worker jobs behind them | **built** |
 | The HTTP API (FastAPI) | **built** |
 | In-memory backends and a development server | **built**: try the API with curl today |
 | Registry on MariaDB (meksha) | waits on TODO item 22 |
 | Source and output stores on Garage (taris) | waits on TODO item 22 |
 | Queues (RQ) and the completion stream (Redis Stream), on meksha's Redis | waits on TODO items 22-23 |
 | Qdrant removal by document | waits on TODO item 23 |
-| The converters: marker, markitdown, transcription through Speaches | wait on TODO items 20-21 |
+| The converters: marker and markitdown, in protocol-droid's two images (`protocol/converters.py`) | **built**; transcription through Speaches waits on TODO items 20 and 68 |
 | Install and management on corelia | a scomp-link script, `protocol/protocol.sh` - TODO item 23 |
 
 TODO items are in Kamino's `review-2026-10-10.md`, "Planned work".

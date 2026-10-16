@@ -5,8 +5,8 @@ Everything here comes from Kamino's `converter-services-2026-10-10.md`
 gives it names. States reuse the conversion leg of `pipeline_spec.md` §4
 rather than inventing a second vocabulary.
 
-The record fields follow the registry sketch there, which is still a sketch
-(To decide 8). One deliberate deviation: `marker_version` and `llm_service`
+The record fields ARE the registry schema (To decide 8, decided 2026-10-16:
+the MariaDB DDL follows these fields). One deliberate deviation: `marker_version` and `llm_service`
 became `tool_versions` and `options`, because the API serves more than one
 converter and each pins different packages.
 """
@@ -21,7 +21,8 @@ CONVERTING = "converting"
 CONVERSION_FAILED = "conversion_failed"
 VALIDATION_PENDING = "validation_pending"
 
-# Removal states are To decide 9; decision 12 names these two.
+# Removal (To decide 9, decided 2026-10-16 as implemented here; decision 12
+# names the two states). Entered from any other state; see service.remove.
 REMOVAL_PENDING = "removal_pending"
 REMOVED = "removed"
 
