@@ -25,7 +25,7 @@ The contract is built and tested. The backends it runs on are not, yet.
 | In-memory backends and a development server | **built**: try the API with curl today |
 | Registry on MariaDB (meksha) | waits on TODO item 22 |
 | Source and output stores on Garage (taris) | waits on TODO item 22 |
-| Queues (RQ) and the completion stream (Redis Stream), on meksha's Redis | waits on TODO items 22-23 |
+| Queues (RQ) and the completion stream (Redis Stream), on meksha's Redis | **built** (`protocol/redis_backends.py`): JSON jobs, one job function, a worker that refuses any other |
 | Qdrant removal by document | waits on TODO item 23 |
 | The converters: marker and markitdown, in protocol-droid's two images (`protocol/converters.py`) | **built**; transcription through Speaches waits on TODO items 20 and 68 |
 | Install and management on corelia | a scomp-link script, `protocol/protocol.sh` - TODO item 23 |
@@ -49,6 +49,16 @@ Before a marker job is queued, `protocol/cost.py` estimates how long it will run
 Over `PROTOCOL_MARKER_HEAVY_SECONDS` (five minutes) it waits in `convert.marker.heavy`, otherwise in `convert.marker.light`, each with its own worker - more workers on one CPU host would only share its threads. **Anything whose cost cannot be read counts as heavy**: the light lane's promise is that nothing slow is in it. The same estimate sizes the job's timeout, and a retry is planned again from the same source, so it returns to its lane.
 
 Reading a PDF's facts takes a few milliseconds and needs `pypdfium2` (in `requirements.txt`); the core runs without it, and then every PDF is an unknown cost.
+
+---
+
+## The queue carries data, never code
+
+An RQ job names a function by import path, and a worker calls it - so by default anything that can write to Redis can run any importable function in a worker. That is not hypothetical: through a plain RQ `SimpleWorker`, a job naming `os.system` runs, **pickled or JSON**. JSON alone does not close it.
+
+`protocol/redis_backends.py` closes it three ways, and all three must hold: jobs are JSON (a pickled payload does not deserialize); every job protocol enqueues names the one function `protocol.worker.run_job` with a single dict; and `GuardedWorker` checks every job before running anything - that function, one dict, and no success, failure or stopped callback, which RQ would also import and call by name. A job that fails the check is failed without being run, and its callbacks are not run either. `tests/test_redis_backends.py` enqueues each of those against a real Redis and proves nothing ran.
+
+Redis itself stays reachable only by the API and the workers. This is the second wall, not the first.
 
 ---
 
