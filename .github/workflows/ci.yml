@@ -95,3 +95,22 @@ jobs:
       - name: the backends' logs, if anything failed
         if: failure()
         run: for c in garage qdrant mariadb; do docker logs "protocol-test-$c" 2>&1 | tail -40; done
+
+  image:
+    # The Containerfile builds, and the image runs protocol.deploy: its check
+    # reports every backend by name and fails, with none to reach.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: build
+        # -f: docker looks for a Dockerfile only; podman finds a Containerfile.
+        run: docker build -f Containerfile -t protocol:ci .
+
+      - name: check, with no backends
+        shell: bash
+        run: |
+          set +e
+          out="$(docker run --rm protocol:ci check)"; rc=$?
+          echo "$out"
+          [[ $rc -eq 1 ]] && grep -q "FAIL  MariaDB" <<< "$out" && grep -q "FAIL  Qdrant" <<< "$out"

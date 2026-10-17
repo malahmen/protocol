@@ -16,19 +16,20 @@ The specification is Kamino's `converter-services-2026-10-10.md` - "The non-bloc
 
 ## Status
 
-The contract is built and tested, and so is every adapter: the converters, the queue, the stores, the registry and the index. What is left is the deployment: the backends on meksha and taris (item 22) and the install script (item 70).
+The contract is built and tested, and so is every adapter: the converters, the queue, the stores, the registry and the index. The backends exist on meksha and the NAS (item 22), and `protocol/deploy.py` runs the service on them; scomp-link's `protocol.sh` installs it on corelia (item 70).
 
 | Part | State |
 | --- | --- |
 | The contract: submit, status, reconvert, remove, prune, and the worker jobs behind them | **built** |
 | The HTTP API (FastAPI) | **built** |
 | In-memory backends and a development server | **built**: try the API with curl today |
-| Registry on MariaDB (meksha) | **built** (`protocol/mariadb_registry.py`, with its DDL); the database and its user on meksha: item 22 |
-| Source and output stores on Garage (taris) | **built** (`protocol/s3_store.py`); the two buckets and their key on taris: item 22 |
-| Queues (RQ) and the completion stream (Redis Stream), on meksha's Redis | **built** (`protocol/redis_backends.py`): JSON jobs, one job function, a worker that refuses any other |
+| Registry on MariaDB (meksha) | **built** (`protocol/mariadb_registry.py`, with its DDL); the database and its user exist on meksha (kuat's `protocol_stores`) |
+| Source and output stores on Garage (taris) | **built** (`protocol/s3_store.py`); the buckets `protocol-sources` and `protocol-outputs` exist on the NAS |
+| Queues (RQ) and the completion stream (Redis Stream), on a Redis of protocol's own on meksha (port 6380, with a password) | **built** (`protocol/redis_backends.py`): JSON jobs, one job function, a worker that refuses any other |
 | Qdrant removal by document and by conversion | **built** (`protocol/qdrant_index.py`) |
 | The converters: marker and markitdown, in protocol-droid's two images (`protocol/converters.py`) | **built**; transcription through Speaches waits on item 68 (running Speaches on corelia, and measuring it) |
-| Install and management on corelia | a scomp-link script, `protocol/protocol.sh`: item 70 |
+| Running it: the API and a worker per lane, from the environment (`protocol/deploy.py`), in images (`Containerfile`) | **built** |
+| Install and management on corelia | **built**: scomp-link's `protocol/protocol.sh` |
 
 Item numbers are Kamino's `todo.md` (private), the to-do list for every project.
 
@@ -96,6 +97,21 @@ curl -s -X POST localhost:8080/documents/<id>/conversions \
 curl -s -X DELETE localhost:8080/documents/<id>/history         # 202, prune non-current outputs
 curl -s -X DELETE localhost:8080/documents/<id>                 # 202, the removal cascade
 ```
+
+---
+
+## Running it
+
+`python -m protocol.deploy` builds the service on the real backends from the variables below and runs one part of it:
+
+```sh
+python -m protocol.deploy check                 # every backend reachable? one line each, no credentials
+python -m protocol.deploy api --port 8080       # the HTTP API; creates the registry's tables first
+python -m protocol.deploy worker marker-light   # one worker: marker-light, marker-heavy, markitdown, maintenance
+python -m protocol.deploy queues                # each queue's depth and dead letters, and its worker
+```
+
+A converter's worker must run where its engine imports, so the `Containerfile` builds three images from one recipe: the API's on plain Python, and protocol on top of protocol-droid's `marker-service` and `markitdown-service` for the two converters' workers (`--build-arg BASE=...`). On corelia, scomp-link's `protocol.sh` builds them from source, holds the credentials as podman secrets, and runs each part as a systemd user service.
 
 ---
 
@@ -201,7 +217,7 @@ The backends:
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `REDIS_URL` | `redis://localhost:6379/0` | meksha's Redis: the queues and the completion stream |
+| `REDIS_URL` | `redis://localhost:6379/0` | protocol's Redis on meksha (`redis://192.168.3.52:6380/0`): the queues and the completion stream |
 | `REDIS_PASSWORD` | unset | never in the URL, so never in a logged setting |
 | `MARIADB_HOST` | (required) | the registry's MariaDB, on meksha |
 | `MARIADB_PORT` | `3306` | |
@@ -210,10 +226,10 @@ The backends:
 | `S3_ENDPOINT` | (required) | Garage on taris, e.g. `http://192.168.3.5:3900`; addressed path-style |
 | `S3_REGION` | `garage` | Garage's `s3_region` |
 | `S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY` | (required) | the service's Garage key |
-| `S3_SOURCES_BUCKET` / `S3_OUTPUTS_BUCKET` | `sources` / `outputs` | |
+| `S3_SOURCES_BUCKET` / `S3_OUTPUTS_BUCKET` | `sources` / `outputs` | `protocol-sources` / `protocol-outputs` on the NAS |
 | `QDRANT_URL` | (required) | |
 | `QDRANT_API_KEY` | unset | |
-| `QDRANT_COLLECTIONS` | (required) | the collections ingestion writes, comma-separated: removal deletes points only there |
+| `QDRANT_COLLECTIONS` | unset | the collections ingestion writes, comma-separated: removal deletes points only there. Unset, removal deletes no vectors and logs that it did not |
 
 ---
 
@@ -235,7 +251,9 @@ protocol/
   mariadb_registry.py  the registry on MariaDB, and its DDL
   qdrant_index.py      removing points from Qdrant
   dev.py        the development server
+  deploy.py     the deployment: the API, a worker per lane, `check`, `queues`
   config.py     settings from the environment
+Containerfile   the images: the API's, and a worker's on top of its engine's
 tests/          stdlib unittest; each backend's tests skip without it
   backends/up.sh  throwaway Garage, Qdrant and MariaDB for those tests
 ```
