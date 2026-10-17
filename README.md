@@ -16,17 +16,17 @@ The specification is Kamino's `converter-services-2026-10-10.md` - "The non-bloc
 
 ## Status
 
-The contract is built and tested, and so are the converters and the queue. The stores and the registry are next.
+The contract is built and tested, and so is every adapter: the converters, the queue, the stores, the registry and the index. What is left is the deployment: the backends on meksha and taris (item 22) and the install script (item 70).
 
 | Part | State |
 | --- | --- |
 | The contract: submit, status, reconvert, remove, prune, and the worker jobs behind them | **built** |
 | The HTTP API (FastAPI) | **built** |
 | In-memory backends and a development server | **built**: try the API with curl today |
-| Registry on MariaDB (meksha) | the adapter: item 69, after Garage and Qdrant; the database and its user on meksha: item 22 |
-| Source and output stores on Garage (taris) | the adapter: item 69, next; the two buckets on taris: item 22 |
+| Registry on MariaDB (meksha) | **built** (`protocol/mariadb_registry.py`, with its DDL); the database and its user on meksha: item 22 |
+| Source and output stores on Garage (taris) | **built** (`protocol/s3_store.py`); the two buckets and their key on taris: item 22 |
 | Queues (RQ) and the completion stream (Redis Stream), on meksha's Redis | **built** (`protocol/redis_backends.py`): JSON jobs, one job function, a worker that refuses any other |
-| Qdrant removal by document | the adapter: item 69 |
+| Qdrant removal by document and by conversion | **built** (`protocol/qdrant_index.py`) |
 | The converters: marker and markitdown, in protocol-droid's two images (`protocol/converters.py`) | **built**; transcription through Speaches waits on item 68 (running Speaches on corelia, and measuring it) |
 | Install and management on corelia | a scomp-link script, `protocol/protocol.sh`: item 70 |
 
@@ -73,6 +73,16 @@ python3.12 -m venv .venv
 .venv/bin/python -m unittest discover -s tests     # the suite
 .venv/bin/python -m protocol.dev                    # the API on http://127.0.0.1:8080 (docs at /docs)
 ```
+
+The adapters' tests need the real backends and skip without them. `tests/backends/up.sh` starts throwaway ones in podman - Garage, Qdrant and MariaDB, on 127.0.0.1 only - and prints the variables that point the suite at them (`ENGINE=docker` for Docker). **The suite empties whatever those variables name**, so they have no defaults; never point them at taris or meksha.
+
+```sh
+eval "$(tests/backends/up.sh)"
+.venv/bin/python -m unittest discover -s tests     # now also on Garage, Qdrant, MariaDB
+tests/backends/up.sh down
+```
+
+With the backends up, every test in `tests/test_service.py` runs a second time with the registry on MariaDB and the stores on Garage underneath.
 
 The development server runs the **real API over in-memory backends**. \
 Nothing persists, and **nothing is really converted**: every converter is replaced by a stand-in that writes a text file back as `out.md`. \
@@ -187,7 +197,23 @@ Removal runs **index, then outputs, then source**, so a removal that stops halfw
 | `PROTOCOL_JOB_TIMEOUT_PER_PAGE` | `180` | per page: ~3x OCR's measured 54.7 s/page |
 | `PROTOCOL_JOB_TIMEOUT_UNKNOWN` | `21600` | a job whose page count cannot be known (6 h) |
 
-The backends' settings (MariaDB, Garage, Redis, Qdrant, Speaches) arrive with their adapters.
+The backends:
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `REDIS_URL` | `redis://localhost:6379/0` | meksha's Redis: the queues and the completion stream |
+| `REDIS_PASSWORD` | unset | never in the URL, so never in a logged setting |
+| `MARIADB_HOST` | (required) | the registry's MariaDB, on meksha |
+| `MARIADB_PORT` | `3306` | |
+| `MARIADB_DATABASE` / `MARIADB_USER` | `protocol` / `protocol` | |
+| `MARIADB_PASSWORD` | (required) | |
+| `S3_ENDPOINT` | (required) | Garage on taris, e.g. `http://192.168.3.5:3900`; addressed path-style |
+| `S3_REGION` | `garage` | Garage's `s3_region` |
+| `S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY` | (required) | the service's Garage key |
+| `S3_SOURCES_BUCKET` / `S3_OUTPUTS_BUCKET` | `sources` / `outputs` | |
+| `QDRANT_URL` | (required) | |
+| `QDRANT_API_KEY` | unset | |
+| `QDRANT_COLLECTIONS` | (required) | the collections ingestion writes, comma-separated: removal deletes points only there |
 
 ---
 
@@ -201,10 +227,17 @@ protocol/
   service.py    the contract: the requests the API makes, the jobs workers run
   worker.py     one job -> one handler
   api.py        the HTTP endpoints
+  cost.py       a marker job's estimated cost: its lane and its timeout
+  converters.py marker and markitdown, through protocol-droid's images
   memory.py     in-memory backends, for the tests and the dev server
+  redis_backends.py  the queue and the completion stream on Redis; the guarded worker
+  s3_store.py   the source and output stores on Garage (S3)
+  mariadb_registry.py  the registry on MariaDB, and its DDL
+  qdrant_index.py      removing points from Qdrant
   dev.py        the development server
   config.py     settings from the environment
-tests/          stdlib unittest; the HTTP tests skip without fastapi
+tests/          stdlib unittest; each backend's tests skip without it
+  backends/up.sh  throwaway Garage, Qdrant and MariaDB for those tests
 ```
 
 The contract talks to its backends only through `ports.py`. That is what let it be written and tested before any backend exists, and what each real adapter has to honour: `memory.py` is the reference for the guarantees.
@@ -214,14 +247,13 @@ Rules the code keeps, each from the specification:
 - **Jobs are data, never code.** RQ pickles whatever callable it is given, so anything that can write to the queue could run code in a worker. Jobs here are plain dicts naming a kind and an ID; the worker already knows the handler.
 - **At-least-once.** A job may run twice. A conversion writes only under its own folder and clears it first, so a second run overwrites its own first attempt and nothing else.
 - **Failures are recorded, not echoed.** The registry keeps the reason for operators; callers see only `conversion failed`.
-- **Idempotent intake.** The registry insert is the uniqueness point (`INSERT ... ON DUPLICATE KEY` on MariaDB). The source is stored before the row exists, so a row never points at a missing source.
+- **Idempotent intake.** The registry insert is the uniqueness point: on MariaDB, a unique key on the hash of live documents, so of two concurrent submissions of the same file one insert wins and the other gets the winner back. The source is stored before the row exists, so a row never points at a missing source.
 
 ### Still open
 
 Each of these is a decision in the specification, not a gap in the code:
 
 - **"Succeeded" means converted, for now.** The specification says a *failed or rejected* reconversion touches nothing. Modes act when the conversion succeeds; if review must approve it first, the same step (`_apply_mode`) moves to the acceptance.
-- **Hash uniqueness among live documents.** A removed document's content can be submitted again as a new document. MariaDB has no partial unique index, so the schema needs a generated column - the hash while live, `NULL` once removed - with a unique index on it.
 - **The registry schema** (To decide 8), **the removal states** (9) and **the ingestion format** (2) - the code follows the sketch and names it where it deviates (`contract.py`).
 - **Not built:** pre-signed uploads straight into the source store, webhooks (allowlisted targets only, when they come), and the retention rule for history.
 

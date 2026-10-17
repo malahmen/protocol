@@ -1,7 +1,7 @@
 # The API process and the workers. Pinned to protocol-droid's versions
 # (resolvable on PyPI as of 2026-09-10, python 3.12). The backends' clients
-# arrive with their adapters (Kamino item 69): RQ and Redis are here; Garage
-# (S3), Qdrant and MariaDB are next.
+# follow, one per adapter; Qdrant needs none (qdrant_index.py speaks its REST
+# API with the standard library).
 fastapi==0.141.1
 uvicorn[standard]==0.52.4
 python-multipart==0.0.32
@@ -14,3 +14,11 @@ pypdfium2==5.10.1
 # The same pins as protocol-droid's workers.
 rq==2.12.0
 redis==8.1.0
+# The stores on Garage (s3_store.py). botocore pinned too: boto3 accepts a
+# range, and an unpinned botocore is how checksum behaviour changed under
+# S3-compatible stores in 1.36. Both released 2026-10-02.
+boto3==1.43.108
+botocore==1.43.108
+# The registry on MariaDB (mariadb_registry.py). Pure Python: no client
+# library to build, nothing to install on the host.
+PyMySQL==1.2.3
