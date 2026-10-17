@@ -31,6 +31,12 @@ class FakeConverter:
         return ConverterOutput(dict(self.files), {self.name: "1.0"})
 
 
+# Set by test_storage_backends while it reruns test_service on real backends:
+# a function returning the parts to use instead of the in-memory ones (any
+# subset of "registry", "store", "index"). None: everything in memory.
+BACKENDS = None
+
+
 def build(settings=None, **converter_overrides):
     converters = {name: FakeConverter(name) for name in CONVERTERS}
     converters.update(converter_overrides)
@@ -41,5 +47,7 @@ def build(settings=None, **converter_overrides):
         "events": memory.Events(),
         "index": memory.Index(),
     }
+    if BACKENDS is not None:
+        parts.update(BACKENDS())
     service = ConversionService(converters=converters, settings=settings or Settings(), **parts)
     return service, parts, converters

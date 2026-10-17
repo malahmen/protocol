@@ -145,7 +145,7 @@ class ConversionTest(Base):
         doc, _, _ = service.submit(PDF, "a.pdf")
         drain(service, parts["queue"])
         self.assertEqual(service.status(doc.document_id)[0].state, c.CONVERSION_FAILED)
-        self.assertFalse(any("escape" in k for k in parts["store"].objects))
+        self.assertFalse(any("escape" in k for k in parts["store"].list("")))
 
     def test_unknown_job_kind(self):
         with self.assertRaises(UnknownJob):
@@ -225,7 +225,7 @@ class RemovalTest(Base):
         drain(self.service, self.queue)
 
         self.assertEqual(order, ["index", "outputs", "source"])
-        self.assertEqual(self.store.objects, {})
+        self.assertEqual(self.store.list(""), [])
         tomb, conversions = self.service.status(doc.document_id)
         self.assertEqual(tomb.state, c.REMOVED)
         self.assertEqual(tomb.content_hash, doc.content_hash)

@@ -31,8 +31,8 @@ class Registry:
     def add_document_if_absent(self, doc: Document) -> tuple[Document, bool]:
         # Unique among LIVE documents: a tombstone keeps its hash, and the same
         # content submitted after a removal is a new document. MariaDB has no
-        # partial unique index, so the real schema needs a generated column
-        # (the hash while live, NULL once removed) with a unique index on it.
+        # partial unique index, so mariadb_registry carries this on a generated
+        # column (the hash while live, NULL once removal starts), uniquely keyed.
         with self._lock:
             for existing in self.documents.values():
                 if existing.content_hash == doc.content_hash and existing.live:

@@ -4,15 +4,15 @@ Each interface is the narrow slice of a real backend the contract uses:
 
 | Port         | Real backend                                 | Adapter                         |
 | ------------ | -------------------------------------------- | ------------------------------- |
-| Registry     | MariaDB on meksha (decision 17)              | to come                         |
-| ObjectStore  | Garage on taris: `sources`, `outputs`        | to come                         |
+| Registry     | MariaDB on meksha (decision 17)              | mariadb_registry.MariaDBRegistry|
+| ObjectStore  | Garage on taris: `sources`, `outputs`        | s3_store.S3Store                |
 | JobQueue     | RQ on meksha's Redis, one queue per converter| redis_backends.RQJobQueue       |
 | EventStream  | Redis Stream `conversions.events`            | redis_backends.RedisStream      |
-| VectorIndex  | Qdrant, points filtered by document_id       | to come                         |
+| VectorIndex  | Qdrant, points filtered by document_id       | qdrant_index.QdrantIndex        |
 | Converter    | marker, markitdown, Speaches (transcription) | converters.EngineConverter (marker, markitdown) |
 
-memory.py has every port, for the tests and the development server. The
-remaining adapters are Kamino `todo.md` item 69.
+memory.py has every port, for the tests and the development server, and is
+the reference each real adapter is tested against (tests/test_storage_backends.py).
 Keeping the contract behind these ports is what lets it be written and tested
 before any of them exists.
 """
@@ -29,8 +29,8 @@ class Registry(Protocol):
         """Insert unless a live document has the same content hash.
 
         Returns (the stored document, created?). This is the idempotency
-        point - INSERT ... ON DUPLICATE KEY in MariaDB - so two concurrent
-        submissions of one file end up as one document.
+        point - a unique key on live documents' hashes in MariaDB - so two
+        concurrent submissions of one file end up as one document.
         """
         ...
 

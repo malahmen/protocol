@@ -65,3 +65,33 @@ jobs:
         env:
           PROTOCOL_TEST_REDIS_URL: redis://localhost:6379/15
         run: python3 -m unittest discover -s tests -v
+
+  storage:
+    # The stores, the registry and the index against real Garage, MariaDB and
+    # Qdrant - started by tests/backends/up.sh, the same script a developer
+    # runs, at the versions the homelab runs (kuat's mariadb_version and
+    # qdrant_version for meksha; taris's Garage, v2.4.1). The suite empties what it is pointed at, so it gets
+    # these throwaway ones and nothing else; without the variables those
+    # checks skip. With them, test_service.py also runs again on top of them.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: install
+        run: python3 -m pip install -r requirements-dev.txt
+
+      - name: start Garage, Qdrant and MariaDB
+        # up.sh prints `export NAME=value` lines; GITHUB_ENV takes NAME=value.
+        shell: bash
+        run: ENGINE=docker tests/backends/up.sh | sed 's/^export //' >> "$GITHUB_ENV"
+
+      - name: tests, with the storage backends
+        run: python3 -m unittest discover -s tests -v
+
+      - name: the backends' logs, if anything failed
+        if: failure()
+        run: for c in garage qdrant mariadb; do docker logs "protocol-test-$c" 2>&1 | tail -40; done
