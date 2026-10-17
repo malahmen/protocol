@@ -6,7 +6,7 @@ from protocol import contract as c
 from protocol import routing
 from protocol.config import Settings
 from protocol.service import Busy, Conflict, NotFound, TooLarge, safe_name
-from protocol.worker import UnknownJob, drain, handle
+from protocol.worker import UnknownJob, drain, handle, recover
 
 PDF = b"%PDF-1.7 pretend"
 
@@ -150,6 +150,94 @@ class ConversionTest(Base):
     def test_unknown_job_kind(self):
         with self.assertRaises(UnknownJob):
             handle(self.service, {"kind": "format-disk"})
+
+
+class Died(BaseException):
+    """What a killed worker looks like from inside: nothing after it runs."""
+
+
+def die():
+    raise Died()
+
+
+class RecoveryTest(Base):
+    """A worker that dies holding a job (Kamino item 87): the queue finds the
+    job abandoned and hands it to worker.recover."""
+
+    def start_and_die(self, service, queue):
+        """Deliver the next job to a worker that is killed mid-conversion."""
+        (job, _delay, _timeout) = queue.jobs[routing.MARKER_HEAVY_QUEUE].pop(0)
+        with self.assertRaises(Died):
+            handle(service, job)
+        return job
+
+    def dying(self):
+        marker = helpers.FakeConverter("marker", on_convert=die)
+        service, parts, _ = helpers.build(marker=marker)
+        return service, parts, marker
+
+    def test_a_conversion_killed_mid_attempt_is_retried_as_a_failed_attempt(self):
+        service, parts, marker = self.dying()
+        doc, conv, _ = service.submit(PDF, "a.pdf")
+        job = self.start_and_die(service, parts["queue"])
+        parts["store"].put(f"outputs/{doc.document_id}/{conv.conversion_id}/half.md", b"x")
+        self.assertEqual(parts["registry"].get_conversion(conv.conversion_id).state, c.CONVERTING)
+        recover(service, job)
+        conv = parts["registry"].get_conversion(conv.conversion_id)
+        self.assertEqual((conv.state, conv.attempts), (c.CONVERSION_PENDING, 1))
+        self.assertEqual(conv.error, "worker died during attempt 1")
+        self.assertEqual(parts["store"].list("outputs/"), [])
+        (_job, delay, timeout), = parts["queue"].jobs[routing.MARKER_HEAVY_QUEUE]
+        self.assertEqual(delay, 30)                       # the same backoff as an error
+        self.assertIsNotNone(timeout)
+        marker.on_convert = None
+        drain(service, parts["queue"])
+        self.assertEqual(service.status(doc.document_id)[0].state, c.VALIDATION_PENDING)
+
+    def test_a_source_that_kills_every_worker_is_parked_after_max_attempts(self):
+        service, parts, _ = self.dying()
+        doc, conv, _ = service.submit(PDF, "a.pdf")
+        for _ in range(3):
+            recover(service, self.start_and_die(service, parts["queue"]))
+        conv = parts["registry"].get_conversion(conv.conversion_id)
+        self.assertEqual((conv.state, conv.attempts), (c.CONVERSION_FAILED, 3))
+        self.assertEqual(conv.error, "worker died during attempt 3")
+        self.assertEqual(service.status(doc.document_id)[0].state, c.CONVERSION_FAILED)
+        self.assertEqual(len(parts["queue"].dead), 1)
+        self.assertEqual(parts["queue"].jobs.get(routing.MARKER_HEAVY_QUEUE, []), [])
+
+    def test_one_taken_but_not_started_is_queued_again_as_it_was(self):
+        doc, conv, _ = self.service.submit(PDF, "a.pdf")
+        (job, _d, timeout), = self.queue.jobs.pop(routing.MARKER_HEAVY_QUEUE)
+        recover(self.service, job)
+        conv = self.parts["registry"].get_conversion(conv.conversion_id)
+        self.assertEqual((conv.state, conv.attempts, conv.error), (c.CONVERSION_PENDING, 0, None))
+        self.assertEqual(self.queue.jobs[routing.MARKER_HEAVY_QUEUE], [(job, 0, timeout)])
+
+    def test_one_that_finished_before_the_worker_died_is_left_alone(self):
+        doc, (conv,) = self.submit_and_convert()
+        recover(self.service, {"kind": "convert", "conversion_id": conv.conversion_id})
+        self.assertEqual(self.queue.jobs.get(routing.MARKER_HEAVY_QUEUE, []), [])
+        self.assertEqual(self.service.status(doc.document_id)[1][0].state, c.VALIDATION_PENDING)
+
+    def test_one_whose_document_was_removed_meanwhile_fails(self):
+        service, parts, _ = self.dying()
+        doc, conv, _ = service.submit(PDF, "a.pdf")
+        job = self.start_and_die(service, parts["queue"])
+        service.remove(doc.document_id)
+        recover(service, job)
+        self.assertEqual(parts["registry"].get_conversion(conv.conversion_id).state,
+                         c.CONVERSION_FAILED)
+
+    def test_removals_and_prunes_run_again_whole(self):
+        for job in ({"kind": "remove", "document_id": "d"},
+                    {"kind": "prune", "document_id": "d", "keep_alternatives": False}):
+            recover(self.service, job)
+        self.assertEqual([j for j, _, _ in self.queue.jobs[routing.MAINTENANCE_QUEUE]],
+                         [{"kind": "remove", "document_id": "d"},
+                          {"kind": "prune", "document_id": "d", "keep_alternatives": False}])
+        with self.assertRaises(UnknownJob):
+            recover(self.service, {"kind": "format-disk"})
 
 
 class ModesTest(Base):

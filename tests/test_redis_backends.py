@@ -23,7 +23,8 @@ from protocol.config import Settings
 
 try:
     from rq import Callback, Queue
-    from rq.registry import FailedJobRegistry
+    from rq.job import Job
+    from rq.registry import FailedJobRegistry, ScheduledJobRegistry, StartedJobRegistry
     from rq.serializers import JSONSerializer
 
     from protocol import redis_backends as rb
@@ -148,6 +149,106 @@ class ThroughTheService(RedisCase):
         self.assertEqual((conv.state, conv.attempts), ("conversion_pending", 1))
         self.assertIn("JobTimeoutException", conv.error)
         self.assertEqual(self.queue.depth("convert.markitdown"), 1)   # the retry, delayed
+
+
+class Died(BaseException):
+    """A killed worker, from inside: nothing after it runs - not RQ's failure
+    handling, not the service's."""
+
+
+def die():
+    raise Died()
+
+
+class Abandoned(RedisCase):
+    """A worker killed holding a job (Kamino item 87): another worker's sweep
+    finds the job and the service retries it."""
+
+    def take_and_die(self, service, queue_name):
+        """A GuardedWorker takes the next job, starts it, and is killed."""
+        q = Queue(queue_name, connection=self.conn, serializer=JSONSerializer)
+        w = rb.GuardedWorker([q], connection=self.conn, serializer=JSONSerializer)
+        rb.protocol_worker.bind(service)
+        job, queue = w.dequeue_job_and_maintain_ttl(timeout=1)
+        w.prepare_execution(job)
+        w.prepare_job_execution(job)
+        with self.assertRaises(Died):
+            job.func(*job.args)
+        return w, job
+
+    def started(self, queue_name):
+        return StartedJobRegistry(queue_name, connection=self.conn, serializer=JSONSerializer)
+
+    def sweep(self, service, queues=(routing.QUEUES["markitdown"],)):
+        rb.protocol_worker.bind(service)
+        return rb.sweep(self.conn, queues,
+                        lambda job: rb.protocol_worker.recover(service, job))
+
+    def test_a_dead_workers_conversion_is_found_and_retried(self):
+        lane = routing.QUEUES["markitdown"]
+        service, parts, _ = self.build(markitdown=helpers.FakeConverter("markitdown", on_convert=die))
+        doc, conv, _ = service.submit(b"PK", "notes.docx")
+        _w, job = self.take_and_die(service, lane)
+        self.assertEqual(self.started(lane).count, 1)
+        self.assertEqual(self.sweep(service), 1)
+        conv = parts["registry"].get_conversion(conv.conversion_id)
+        self.assertEqual((conv.state, conv.error), ("conversion_pending", "worker died during attempt 1"))
+        self.assertEqual(self.started(lane).count, 0)
+        self.assertFalse(Job.exists(job.id, connection=self.conn))
+        self.assertEqual(self.queue.depth(lane), 1)                 # the retry, delayed
+        self.assertEqual(self.sweep(service), 0)                    # and only once
+
+    def test_a_live_workers_job_is_left_alone(self):
+        lane = routing.QUEUES["markitdown"]
+        service, parts, _ = self.build(markitdown=helpers.FakeConverter("markitdown", on_convert=die))
+        doc, conv, _ = service.submit(b"PK", "notes.docx")
+        w, _job = self.take_and_die(service, lane)
+        with rb.Alive(self.conn, w.name):
+            self.assertEqual(self.sweep(service), 0)
+        self.assertEqual(self.started(lane).count, 1)
+        self.assertEqual(parts["registry"].get_conversion(conv.conversion_id).state, "converting")
+        self.assertFalse(self.conn.exists(rb.ALIVE_PREFIX + w.name))   # gone with its worker
+
+    def test_a_failed_recovery_leaves_the_job_for_the_next_sweep(self):
+        lane = routing.QUEUES["markitdown"]
+        service, parts, _ = self.build(markitdown=helpers.FakeConverter("markitdown", on_convert=die))
+        doc, conv, _ = service.submit(b"PK", "notes.docx")
+        self.take_and_die(service, lane)
+        with mock.patch.object(service, "recover_conversion", side_effect=ConnectionError("db away")):
+            self.assertEqual(self.sweep(service), 0)
+        self.assertEqual(self.started(lane).count, 1)
+        self.assertEqual(self.sweep(service), 1)
+
+    def test_a_foreign_job_in_progress_is_left_to_rq(self):
+        lane = routing.QUEUES["markitdown"]
+        Queue(lane, connection=self.conn, serializer=JSONSerializer).enqueue("os.system", "true")
+        q = Queue(lane, connection=self.conn, serializer=JSONSerializer)
+        w = rb.GuardedWorker([q], connection=self.conn, serializer=JSONSerializer)
+        job, _ = w.dequeue_job_and_maintain_ttl(timeout=1)
+        w.prepare_execution(job)
+        service, _, _ = self.build()
+        self.assertEqual(self.sweep(service), 0)
+        self.assertEqual(self.started(lane).count, 1)
+
+    def test_a_worker_sweeps_other_lanes_at_start_and_keeps_its_key_while_it_works(self):
+        lane = routing.QUEUES["markitdown"]
+        service, parts, convs = self.build(markitdown=helpers.FakeConverter("markitdown", on_convert=die))
+        doc, conv, _ = service.submit(b"PK", "notes.docx")
+        self.take_and_die(service, lane)
+        # The maintenance worker - another lane - finds it when it starts.
+        rb.run_worker(service, [routing.MAINTENANCE_QUEUE], self.conn, burst=True,
+                      sweep_queues=[lane, routing.MAINTENANCE_QUEUE])
+        self.assertEqual(parts["registry"].get_conversion(conv.conversion_id).state, "conversion_pending")
+        # The retry is delayed; bring it forward and let a markitdown worker run it.
+        q = Queue(lane, connection=self.conn, serializer=JSONSerializer)
+        for job_id in ScheduledJobRegistry(queue=q).get_job_ids():
+            q.enqueue_job(Job.fetch(job_id, connection=self.conn, serializer=JSONSerializer))
+        alive = []
+        convs["markitdown"].on_convert = lambda: alive.append(self.conn.keys(rb.ALIVE_PREFIX + "*"))
+        self.work(service, [lane])
+        self.assertEqual(parts["registry"].get_conversion(conv.conversion_id).state, "validation_pending")
+        self.assertEqual([len(keys) for keys in alive], [1])          # its key, while converting
+        self.assertEqual(self.conn.keys(rb.ALIVE_PREFIX + "*"), [])   # and gone after
 
 
 class Refused(RedisCase):
