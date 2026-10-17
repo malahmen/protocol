@@ -104,7 +104,8 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: build
-        run: docker build -t protocol:ci .
+        # -f: docker looks for a Dockerfile only; podman finds a Containerfile.
+        run: docker build -f Containerfile -t protocol:ci .
 
       - name: check, with no backends
         shell: bash
