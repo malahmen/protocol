@@ -5,6 +5,7 @@ import helpers
 from protocol import contract as c
 from protocol import routing
 from protocol.config import Settings
+from protocol.ports import ConversionTimeout
 from protocol.service import Busy, Conflict, NotFound, TooLarge, safe_name
 from protocol.worker import UnknownJob, drain, handle, recover
 
@@ -138,6 +139,19 @@ class ConversionTest(Base):
             handle(service, job)
         self.assertEqual(delays, [0, 30, 60])
         self.assertEqual(service.status(doc.document_id)[0].state, c.VALIDATION_PENDING)
+
+    def test_a_timeout_is_final(self):
+        class TimesOut(helpers.FakeConverter):
+            def convert(self, *a):
+                raise ConversionTimeout("ran past 1800 s")
+        service, parts, _ = helpers.build(marker=TimesOut("marker"))
+        doc, conv, _ = service.submit(PDF, "a.pdf")
+        drain(service, parts["queue"])
+        doc, (conv,) = service.status(doc.document_id)
+        self.assertEqual((conv.state, conv.attempts), (c.CONVERSION_FAILED, 1))
+        self.assertIn("not retried", conv.error)
+        self.assertEqual(len(parts["queue"].dead), 1)
+        self.assertEqual(parts["store"].list("outputs/"), [])
 
     def test_an_unsafe_output_name_fails_the_conversion(self):
         service, parts, _ = helpers.build(

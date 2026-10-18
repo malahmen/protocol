@@ -69,6 +69,12 @@ class JobQueue(Protocol):
     def dead_letter(self, queue: str, job: dict, reason: str) -> None: ...
 
 
+class ConversionTimeout(Exception):
+    """A job ran past its `timeout_seconds`. The queue's adapter raises it (or
+    a subclass of it) inside the conversion, so the service can tell a timeout
+    from any other error without knowing the queue (Kamino item 79)."""
+
+
 class EventStream(Protocol):
     def append(self, event: dict) -> None: ...
 
