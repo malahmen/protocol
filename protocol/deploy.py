@@ -113,7 +113,9 @@ def work(name: str) -> None:
         seconds = service.converters[converter].warm_up()
         log.info("%s warmed up%s", converter, f" in {seconds:.1f}s" if seconds else "")
     log.info("worker %s on %s", name, ", ".join(queues))
-    redis_backends.run_worker(service, queues, redis_backends.connect())
+    # Every worker sweeps every lane for jobs a dead worker left (item 87).
+    every_lane = sorted({q for _, qs in WORKERS.values() for q in qs})
+    redis_backends.run_worker(service, queues, redis_backends.connect(), sweep_queues=every_lane)
 
 
 def _qdrant_check() -> str:

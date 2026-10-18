@@ -6,7 +6,8 @@ Two halves:
   the API. Each records the request, queues the work and returns at once.
   Nothing here waits on a conversion (decision 10).
 - **Jobs** (`run_conversion`, `run_removal`, `run_prune`) - called by workers,
-  through `worker.handle`.
+  through `worker.handle`; `recover_conversion` for one whose worker died
+  holding it, through `worker.recover`.
 
 The rules from the specification that shape the code:
 
@@ -228,17 +229,7 @@ class ConversionService:
                 self.store.put(prefix + _safe_relative(name), content)
         except Exception as exc:  # noqa: BLE001 - every failure is recorded, then retried or parked
             self.store.delete_prefix(prefix)
-            reason = f"{type(exc).__name__}: {exc}"[:1000]
-            if conv.attempts < self.settings.max_attempts:
-                conv.state = c.CONVERSION_PENDING
-                conv.error = reason
-                self.registry.save_conversion(conv)
-                delay = self.settings.retry_base_seconds * 2 ** (conv.attempts - 1)
-                queue, timeout = self._plan(conv.converter, doc.original_name, data, conv.options)
-                self.queue.enqueue(queue, {"kind": "convert", "conversion_id": conv.conversion_id},
-                                   delay, timeout_seconds=timeout)
-            else:
-                self._fail(conv, doc, reason)
+            self._attempt_failed(conv, doc, data, f"{type(exc).__name__}: {exc}")
             return
 
         conv.tool_versions = dict(result.tool_versions)
@@ -259,6 +250,49 @@ class ConversionService:
                             "conversion_id": conv.conversion_id, "state": conv.state,
                             "output_key": conv.output_key, "mode": conv.mode, "role": conv.role,
                             "previous_conversion_id": previous})
+
+    def recover_conversion(self, conversion_id: str) -> None:
+        """A conversion whose worker died while it held the job (Kamino item 87).
+
+        Called when the queue finds the job abandoned - the worker killed by a
+        restart, a reboot or the OOM killer - so run_conversion never reached
+        its own error handling. A conversion caught mid-attempt counts that
+        attempt as failed and is retried or parked exactly as an error inside
+        the converter would be; so a source that kills its worker every time
+        is dead-lettered after PROTOCOL_MAX_ATTEMPTS, not retried for ever.
+        One the worker had taken but not yet started is queued again as it was.
+        """
+        conv = self.registry.get_conversion(conversion_id)
+        if conv is None or conv.state in (c.VALIDATION_PENDING, c.CONVERSION_FAILED):
+            return  # unknown, or finished before the worker died
+        doc = self.registry.get_document(conv.document_id)
+        if doc is None or not doc.live:
+            self._fail(conv, doc, "document removed before conversion")
+            return
+        # Only marker's lane depends on the source (_plan), so only marker reads it.
+        data = self.store.get(doc.source_key) if conv.converter == "marker" else None
+        if conv.state != c.CONVERTING:
+            queue, timeout = self._plan(conv.converter, doc.original_name, data, conv.options)
+            self.queue.enqueue(queue, {"kind": "convert", "conversion_id": conv.conversion_id},
+                               timeout_seconds=timeout)
+            return
+        self.store.delete_prefix(c.output_prefix(doc.document_id, conv.conversion_id))
+        self._attempt_failed(conv, doc, data, f"worker died during attempt {conv.attempts}")
+
+    def _attempt_failed(self, conv: c.Conversion, doc: c.Document, data: Optional[bytes],
+                        reason: str) -> None:
+        """Retry after a delay that doubles per attempt, or park it once out of attempts."""
+        reason = reason[:1000]
+        if conv.attempts < self.settings.max_attempts:
+            conv.state = c.CONVERSION_PENDING
+            conv.error = reason
+            self.registry.save_conversion(conv)
+            delay = self.settings.retry_base_seconds * 2 ** (conv.attempts - 1)
+            queue, timeout = self._plan(conv.converter, doc.original_name, data, conv.options)
+            self.queue.enqueue(queue, {"kind": "convert", "conversion_id": conv.conversion_id},
+                               delay, timeout_seconds=timeout)
+        else:
+            self._fail(conv, doc, reason)
 
     def _apply_mode(self, doc: c.Document, conv: c.Conversion) -> Optional[str]:
         """Decision 13, applied once the new conversion has succeeded.

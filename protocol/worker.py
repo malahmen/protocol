@@ -11,6 +11,7 @@ service cannot travel with the job - and must not.
 """
 from typing import Optional
 
+from . import routing
 from .service import ConversionService
 
 # The import path RQ is given for every job. A worker runs nothing else.
@@ -25,13 +26,18 @@ def bind(service: ConversionService) -> None:
     _service = service
 
 
-def run_job(job: dict) -> None:
-    """RQ's entry point: one job dict, run against the bound service."""
+def bound() -> ConversionService:
     if _service is None:
         raise RuntimeError("no service bound in this worker process (protocol.worker.bind)")
+    return _service
+
+
+def run_job(job: dict) -> None:
+    """RQ's entry point: one job dict, run against the bound service."""
+    service = bound()
     if not isinstance(job, dict):
         raise UnknownJob(f"a job is a dict, got {type(job).__name__}")
-    handle(_service, job)
+    handle(service, job)
 
 
 class UnknownJob(ValueError):
@@ -46,6 +52,22 @@ def handle(service: ConversionService, job: dict) -> None:
         service.run_removal(job["document_id"])
     elif kind == "prune":
         service.run_prune(job["document_id"], bool(job.get("keep_alternatives")))
+    else:
+        raise UnknownJob(f"unknown job kind: {kind!r}")
+
+
+def recover(service: ConversionService, job: dict) -> None:
+    """A job whose worker died while running it (Kamino item 87).
+
+    A conversion goes back through the service, which counts the lost
+    attempt. A removal or a prune is queued again whole: both are written to
+    run twice, so finishing a half-done one is running it again.
+    """
+    kind = job.get("kind")
+    if kind == "convert":
+        service.recover_conversion(job["conversion_id"])
+    elif kind in ("remove", "prune"):
+        service.queue.enqueue(routing.MAINTENANCE_QUEUE, job)
     else:
         raise UnknownJob(f"unknown job kind: {kind!r}")
 

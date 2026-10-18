@@ -264,6 +264,7 @@ Rules the code keeps, each from the specification:
 
 - **Jobs are data, never code.** RQ pickles whatever callable it is given, so anything that can write to the queue could run code in a worker. Jobs here are plain dicts naming a kind and an ID; the worker already knows the handler.
 - **At-least-once.** A job may run twice. A conversion writes only under its own folder and clears it first, so a second run overwrites its own first attempt and nothing else.
+- **A dead worker's job is not lost.** A worker killed holding a job (a restart, a reboot, the OOM killer) never reaches the service's error handling, and RQ would only fail the job once its timeout ran out, hours later for a big PDF, without telling protocol. Each worker keeps a short-lived key alive in Redis from a thread; between jobs, every worker sweeps every lane for a job in progress whose worker's key has gone, and hands it back to the service. The lost run counts as a failed attempt, so a source that kills its worker every time is dead-lettered after `PROTOCOL_MAX_ATTEMPTS` instead of looping. Recovery takes about two minutes (`redis_backends.py`).
 - **Failures are recorded, not echoed.** The registry keeps the reason for operators; callers see only `conversion failed`.
 - **Idempotent intake.** The registry insert is the uniqueness point: on MariaDB, a unique key on the hash of live documents, so of two concurrent submissions of the same file one insert wins and the other gets the winner back. The source is stored before the row exists, so a row never points at a missing source.
 
