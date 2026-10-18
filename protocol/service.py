@@ -15,6 +15,7 @@ The rules from the specification that shape the code:
   removal; outputs go only through `replace`, a prune, or removal.
 - A reconversion's mode acts only once it has succeeded (13); a failure
   touches nothing.
+- A timeout is final: retried, it would only hold its lane as long again.
 - At-least-once: a job may run twice, so a conversion writes only under its
   own `outputs/<document_id>/<conversion_id>/`, clearing it first.
 - Removal runs index -> outputs -> source, so a half-done removal never leaves
@@ -30,7 +31,8 @@ from . import contract as c
 from . import cost
 from . import routing
 from .config import Settings
-from .ports import Converter, EventStream, JobQueue, ObjectStore, Registry, VectorIndex
+from .ports import (Converter, ConversionTimeout, EventStream, JobQueue, ObjectStore, Registry,
+                    VectorIndex)
 from .routing import InvalidRequest
 
 PROVENANCE_FILE = "provenance.json"
@@ -229,7 +231,15 @@ class ConversionService:
                 self.store.put(prefix + _safe_relative(name), content)
         except Exception as exc:  # noqa: BLE001 - every failure is recorded, then retried or parked
             self.store.delete_prefix(prefix)
-            self._attempt_failed(conv, doc, data, f"{type(exc).__name__}: {exc}")
+            reason = f"{type(exc).__name__}: {exc}"
+            if isinstance(exc, ConversionTimeout):
+                # Final (Kamino item 79): the allowance is ~3x the measured
+                # rate, so a run that used it all was misjudged or stuck, and
+                # a retry would hold the lane as long again. A reconversion
+                # with a page range, or a larger allowance, is the way back.
+                self._fail(conv, doc, reason + " (a timeout is final; not retried)")
+            else:
+                self._attempt_failed(conv, doc, data, reason)
             return
 
         conv.tool_versions = dict(result.tool_versions)

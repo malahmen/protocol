@@ -138,7 +138,7 @@ class ThroughTheService(RedisCase):
         self.work(service, routing.worker_queues("marker"))
         self.assertEqual([call[1] for call in convs["marker"].calls], ["note.pdf", "book.pdf"])
 
-    def test_a_timed_out_conversion_is_a_failed_attempt_and_retried(self):
+    def test_a_timed_out_conversion_fails_at_once_and_is_not_retried(self):
         slow = helpers.FakeConverter("markitdown", on_convert=lambda: time.sleep(5))
         service, parts, _ = self.build(Settings(job_timeout_unknown=1), markitdown=slow)
         doc, conv, _ = service.submit(b"PK", "slow.docx")
@@ -146,9 +146,11 @@ class ThroughTheService(RedisCase):
         self.work(service, routing.worker_queues("markitdown"))
         self.assertLess(time.monotonic() - started, 4)          # stopped, not waited out
         conv = parts["registry"].get_conversion(conv.conversion_id)
-        self.assertEqual((conv.state, conv.attempts), ("conversion_pending", 1))
-        self.assertIn("JobTimeoutException", conv.error)
-        self.assertEqual(self.queue.depth("convert.markitdown"), 1)   # the retry, delayed
+        self.assertEqual((conv.state, conv.attempts), ("conversion_failed", 1))
+        self.assertIn("JobTimedOut", conv.error)
+        self.assertIn("not retried", conv.error)
+        self.assertEqual(self.queue.depth("convert.markitdown"), 0)
+        self.assertEqual(len(self.queue.dead_letters("convert.markitdown")), 1)
 
 
 class Died(BaseException):

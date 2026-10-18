@@ -47,7 +47,7 @@ Before a marker job is queued, `protocol/cost.py` estimates how long it will run
 | a scanned book | 166 | yes | 2.5 h | heavy |
 | a 387-page text book | 387 | no | 21 min | heavy |
 
-Over `PROTOCOL_MARKER_HEAVY_SECONDS` (five minutes) it waits in `convert.marker.heavy`, otherwise in `convert.marker.light`, each with its own worker - more workers on one CPU host would only share its threads. **Anything whose cost cannot be read counts as heavy**: the light lane's promise is that nothing slow is in it. The same estimate sizes the job's timeout, and a retry is planned again from the same source, so it returns to its lane.
+Over `PROTOCOL_MARKER_HEAVY_SECONDS` (five minutes) it waits in `convert.marker.heavy`, otherwise in `convert.marker.light`, each with its own worker - more workers on one CPU host would only share its threads. **Anything whose cost cannot be read counts as heavy**: the light lane's promise is that nothing slow is in it. The same estimate sizes the job's timeout, and a retry is planned again from the same source, so it returns to its lane. **A timeout is final**: the allowance is about three times the measured rate, so a job that uses it all was misjudged or is stuck, and a retry would hold the lane as long again. It fails at once and is dead-lettered; reconvert it with a `page_range`, or with a larger `PROTOCOL_JOB_TIMEOUT_*`.
 
 Reading a PDF's facts takes a few milliseconds and needs `pypdfium2` (in `requirements.txt`); the core runs without it, and then every PDF is an unknown cost.
 
@@ -204,7 +204,7 @@ Removal runs **index, then outputs, then source**, so a removal that stops halfw
 | `PROTOCOL_MAX_UPLOAD_BYTES` | `536870912` | largest accepted source (512 MiB) |
 | `PROTOCOL_QUEUE_MAX_DEPTH` | `1000` | jobs waiting in one queue before submissions get `429` |
 | `PROTOCOL_MAX_ATTEMPTS` | `3` | tries per conversion before it is dead-lettered |
-| `PROTOCOL_RETRY_BASE_SECONDS` | `30` | first retry delay; doubles per attempt |
+| `PROTOCOL_RETRY_BASE_SECONDS` | `30` | first retry delay; doubles per attempt (a timeout is not retried) |
 | `PAGE_RANGE_MAX_PAGES` | `2000` | most pages one marker `page_range` may cover |
 | `PAGE_RANGE_MAX_INDEX` | `100000` | highest page a marker `page_range` may name |
 | `LLM_SERVICE` | unset | set: marker's `use_llm` is allowed |

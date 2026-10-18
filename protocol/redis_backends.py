@@ -28,9 +28,11 @@ Redis itself stays closed to everything but the API and the workers; this is
 the second wall, not the first.
 
 Timeouts are RQ's: a job that runs past its `timeout_seconds` gets
-JobTimeoutException raised inside the conversion, which the service records
-as a failed attempt like any other error. That needs the job on the worker's
-main thread, which SimpleWorker gives.
+JobTimeoutException raised inside the conversion. The worker's death penalty
+raises `JobTimedOut` instead - still RQ's JobTimeoutException, and also
+ports.ConversionTimeout, which the service fails at once rather than retrying
+(Kamino item 79). That needs the job on the worker's main thread, which
+SimpleWorker gives.
 
 **A worker that dies holding a job** (Kamino item 87) - killed by a restart,
 a reboot, the OOM killer - never reaches the service's error handling, and
@@ -64,9 +66,11 @@ from rq.exceptions import NoSuchJobError
 from rq.job import Job
 from rq.registry import ScheduledJobRegistry, StartedJobRegistry
 from rq.serializers import JSONSerializer
+from rq.timeouts import JobTimeoutException, UnixSignalDeathPenalty
 from rq.utils import parse_composite_key
 
 from . import worker as protocol_worker
+from .ports import ConversionTimeout
 from .worker import JOB_FUNC
 
 EVENTS_STREAM = "conversions.events"
@@ -255,6 +259,19 @@ def sweep(connection: Redis, queues: Iterable[str], recover) -> int:
     return handed
 
 
+class JobTimedOut(JobTimeoutException, ConversionTimeout):
+    """RQ's timeout, as the service knows it (ports.ConversionTimeout)."""
+
+
+class TimeoutPenalty(UnixSignalDeathPenalty):
+    """RQ's SIGALRM timeout, raising JobTimedOut for a job's own timeout."""
+
+    def __init__(self, timeout, exception=JobTimeoutException, **kwargs):
+        if exception is JobTimeoutException:
+            exception = JobTimedOut
+        super().__init__(timeout, exception, **kwargs)
+
+
 class GuardedWorker(SimpleWorker):
     """SimpleWorker - no fork, so marker's models load once - that runs only
     protocol's job function. See the module docstring for why each check.
@@ -263,6 +280,7 @@ class GuardedWorker(SimpleWorker):
     worker died (`sweep`)."""
 
     serializer = JSONSerializer
+    death_penalty_class = TimeoutPenalty
     sweep_queues: tuple = ()
 
     def execute_job(self, job, queue):
