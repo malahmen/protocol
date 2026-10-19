@@ -108,7 +108,14 @@ def recover(service: ConversionService, job: dict) -> None:
     if kind == "convert":
         service.recover_conversion(job["conversion_id"])
     elif kind in ("remove", "prune"):
-        service.queue.enqueue(routing.MAINTENANCE_QUEUE, job)
+        # Counted, as a conversion's attempts are: one that kills its worker
+        # every time is parked after max_attempts, not run for ever (item 99).
+        lost = int(job.get("recoveries", 0)) + 1
+        if lost >= service.settings.max_attempts:
+            service.queue.dead_letter(routing.MAINTENANCE_QUEUE, job,
+                                      f"its worker died {lost} times running it")
+            return
+        service.queue.enqueue(routing.MAINTENANCE_QUEUE, dict(job, recoveries=lost))
     else:
         raise UnknownJob(f"unknown job kind: {kind!r}")
 

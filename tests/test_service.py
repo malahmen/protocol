@@ -248,10 +248,26 @@ class RecoveryTest(Base):
                     {"kind": "prune", "document_id": "d", "keep_alternatives": False}):
             recover(self.service, job)
         self.assertEqual([j for j, _, _ in self.queue.jobs[routing.MAINTENANCE_QUEUE]],
-                         [{"kind": "remove", "document_id": "d"},
-                          {"kind": "prune", "document_id": "d", "keep_alternatives": False}])
+                         [{"kind": "remove", "document_id": "d", "recoveries": 1},
+                          {"kind": "prune", "document_id": "d", "keep_alternatives": False,
+                           "recoveries": 1}])
         with self.assertRaises(UnknownJob):
             recover(self.service, {"kind": "format-disk"})
+
+    def test_a_removal_that_kills_its_worker_every_time_is_parked(self):
+        # Item 99: conversions stop after max_attempts; removals and prunes
+        # were queued again for ever.
+        job = {"kind": "remove", "document_id": "d"}
+        for _ in range(self.service.settings.max_attempts):
+            recover(self.service, job)
+            pending = self.queue.jobs.get(routing.MAINTENANCE_QUEUE, [])
+            job = pending.pop(0)[0] if pending else None
+            if job is None:
+                break
+        self.assertIsNone(job, "still queued after max_attempts lost runs")
+        ((queue, dead, reason),) = self.queue.dead
+        self.assertEqual((queue, dead["document_id"]), (routing.MAINTENANCE_QUEUE, "d"))
+        self.assertIn(f"died {self.service.settings.max_attempts} times", reason)
 
 
 class ModesTest(Base):

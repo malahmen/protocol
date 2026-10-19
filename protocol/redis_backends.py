@@ -90,6 +90,7 @@ ALIVE_EVERY = 15                         # how often a live one says otherwise
 SWEEP_EVERY = 60                         # between sweeps, while a worker is idle
 SWEEP_CLAIM_PREFIX = "protocol:sweep:"
 SWEEP_CLAIM_TTL = 300                    # one sweeper per abandoned job
+RECOVERED_CLAIM_TTL = 86400   # a recovered job's claim: no sweep takes it again (item 99)
 
 log = logging.getLogger("protocol.redis_backends")
 
@@ -291,8 +292,16 @@ def sweep(connection: Redis, queues: Iterable[str], recover) -> int:
                 log.exception("could not recover abandoned job %s on %s", job_id, name)
                 connection.delete(claim)
                 continue
-            connection.zrem(registry.key, entry)
-            job.delete(remove_from_queue=True)
+            # Recovered: from here the job must never be recovered again. The
+            # claim is kept for a day first, so a failure in the bookkeeping
+            # below cannot let it expire and a later sweep count a second lost
+            # attempt (Kamino item 99); RQ's own expiry drops a leftover entry.
+            connection.set(claim, "recovered", ex=RECOVERED_CLAIM_TTL)
+            try:
+                connection.zrem(registry.key, entry)
+                job.delete(remove_from_queue=True)
+            except Exception:  # noqa: BLE001 - recovered already; the entry expires on its own
+                log.exception("recovered job %s on %s, but could not clear its RQ record", job_id, name)
             handed += 1
             log.warning("job %s on %s was abandoned by dead worker %s; recovered %s",
                         job_id, name, worker.decode(), json.dumps(payload, sort_keys=True))

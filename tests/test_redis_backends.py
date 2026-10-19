@@ -276,6 +276,19 @@ class Abandoned(RedisCase):
         self.assertEqual(self.queue.depth(lane), 1)                 # the retry, delayed
         self.assertEqual(self.sweep(service), 0)                    # and only once
 
+    def test_a_recovered_job_is_never_recovered_again_even_if_its_cleanup_fails(self):
+        # Item 99: zrem/job.delete raising after recover() used to escape the
+        # sweep, and the 300 s claim then expired: a later sweep recovered the
+        # job again and counted a second lost attempt.
+        lane = routing.QUEUES["markitdown"]
+        service, parts, _ = self.build(markitdown=helpers.FakeConverter("markitdown", on_convert=die))
+        doc, conv, _ = service.submit(b"PK", "notes.docx")
+        _w, job = self.take_and_die(service, lane)
+        with mock.patch.object(rb.GuardedJob, "delete", side_effect=ConnectionError("redis blip")):
+            self.assertEqual(self.sweep(service), 1)
+        self.assertGreater(self.conn.ttl(rb.SWEEP_CLAIM_PREFIX + job.id), rb.SWEEP_CLAIM_TTL)
+        self.assertEqual(parts["registry"].get_conversion(conv.conversion_id).attempts, 1)
+
     def test_a_live_workers_job_is_left_alone(self):
         lane = routing.QUEUES["markitdown"]
         service, parts, _ = self.build(markitdown=helpers.FakeConverter("markitdown", on_convert=die))
