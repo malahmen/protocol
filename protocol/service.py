@@ -197,9 +197,15 @@ class ConversionService:
         return conv
 
     def remove(self, document_id: str) -> c.Document:
-        """Queue the removal cascade. Asking twice is the same request."""
+        """Queue the removal cascade. Asking again while it is pending queues it
+        again: a removal stranded by an error could otherwise never be asked
+        for (Kamino item 94), and a second run finds it removed and does
+        nothing."""
         doc = self._known(document_id)
-        if doc.state in (c.REMOVAL_PENDING, c.REMOVED):
+        if doc.state == c.REMOVED:
+            return doc
+        if doc.state == c.REMOVAL_PENDING:
+            self.queue.enqueue(routing.MAINTENANCE_QUEUE, {"kind": "remove", "document_id": doc.document_id})
             return doc
         doc.state = c.REMOVAL_PENDING
         self.registry.save_document(doc)

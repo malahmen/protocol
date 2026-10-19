@@ -151,6 +151,59 @@ class ThroughTheService(RedisCase):
         ((_id, fields),) = self.conn.xrange(rb.EVENTS_STREAM)
         self.assertEqual(json.loads(fields[b"data"])["conversion_id"], conv.conversion_id)
 
+    def _no_delay(self):
+        # The infra retry's delay, and the service's own: 0, so a burst worker
+        # reaches the requeued job.
+        from protocol import worker as protocol_worker
+        patcher = mock.patch.object(protocol_worker, "INFRA_RETRY_BASE", 0, create=True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return Settings(retry_base_seconds=0)
+
+    def test_a_store_blip_outside_the_converter_is_retried_not_stranded(self):
+        # Item 94: the converter fails, then Garage blips while its partial
+        # output is cleared - outside the converter's try. RQ failed the job,
+        # the worker was alive, and the conversion stayed `converting` for good.
+        service, parts, _ = self.build(self._no_delay(),
+                                       markitdown=helpers.FakeConverter("markitdown", fail_times=1))
+        store, real, calls = parts["store"], parts["store"].delete_prefix, []
+
+        def blip(prefix):
+            calls.append(prefix)
+            if len(calls) == 1:
+                raise ConnectionError("garage blip")
+            return real(prefix)
+        store.delete_prefix = blip
+        doc, conv, _ = service.submit(b"PK", "notes.docx")
+        self.work(service, routing.worker_queues("markitdown"))
+        conv = parts["registry"].get_conversion(conv.conversion_id)
+        self.assertEqual(conv.state, "validation_pending")
+
+    def test_a_removal_blip_is_retried(self):
+        service, parts, _ = self.build(self._no_delay())
+        doc, _, _ = service.submit(b"PK", "notes.docx")
+        self.work(service, routing.worker_queues("markitdown"))
+        index, real, calls = parts["index"], parts["index"].delete_document, []
+
+        def blip(document_id):
+            calls.append(document_id)
+            if len(calls) == 1:
+                raise ConnectionError("qdrant blip")
+            return real(document_id)
+        index.delete_document = blip
+        service.remove(doc.document_id)
+        self.work(service, [routing.MAINTENANCE_QUEUE])
+        self.assertEqual(service.status(doc.document_id)[0].state, "removed")
+
+    def test_a_job_that_fails_outside_the_converter_every_time_is_dead_lettered(self):
+        service, parts, _ = self.build(self._no_delay())
+        doc, conv, _ = service.submit(b"PK", "notes.docx")
+        parts["registry"].save_conversion = mock.Mock(side_effect=ConnectionError("mariadb down"))
+        self.work(service, routing.worker_queues("markitdown"))
+        (dead,) = self.queue.dead_letters("convert.markitdown")
+        self.assertIn("gave up after 6 retries: ConnectionError: mariadb down", dead["reason"])
+        self.assertEqual(self.queue.depth("convert.markitdown"), 0)
+
     def test_a_marker_worker_takes_the_light_lane_first(self):
         service, _, convs = self.build()
         light, heavy = routing.MARKER_LIGHT_QUEUE, routing.MARKER_HEAVY_QUEUE

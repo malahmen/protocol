@@ -9,6 +9,7 @@ any job that names anything else. run_job reaches the service a worker
 process `bind`s at startup: RQ calls a function by import path, so the
 service cannot travel with the job - and must not.
 """
+import logging
 from typing import Optional
 
 from . import routing
@@ -16,6 +17,17 @@ from .service import ConversionService
 
 # The import path RQ is given for every job. A worker runs nothing else.
 JOB_FUNC = "protocol.worker.run_job"
+
+# A job that fails outside the converter - the registry, the store, the index
+# or the queue unreachable - is queued again after INFRA_RETRY_BASE seconds,
+# doubling, up to INFRA_RETRY_MAX times (30 s ... 16 min, ~32 min in all),
+# then dead-lettered with the reason (Kamino item 94). Before, RQ just failed
+# it: the worker was alive, so item 87's sweep never saw it, and the
+# conversion stayed `converting` (a removal `removal_pending`) for good.
+INFRA_RETRY_BASE = 30
+INFRA_RETRY_MAX = 6
+
+log = logging.getLogger(__name__)
 
 _service: Optional[ConversionService] = None
 
@@ -33,11 +45,40 @@ def bound() -> ConversionService:
 
 
 def run_job(job: dict) -> None:
-    """RQ's entry point: one job dict, run against the bound service."""
+    """RQ's entry point: one job dict, run against the bound service.
+
+    The service records every failure inside a converter itself; what escapes
+    here failed around it (see INFRA_RETRY_BASE), and is retried."""
     service = bound()
     if not isinstance(job, dict):
         raise UnknownJob(f"a job is a dict, got {type(job).__name__}")
-    handle(service, job)
+    try:
+        handle(service, job)
+    except UnknownJob:
+        raise
+    except Exception as exc:
+        retry_infra(service, job, exc)
+        raise
+
+
+def retry_infra(service: ConversionService, job: dict, exc: BaseException) -> None:
+    """Queue `job` again on the queue it came from, later; or dead-letter it."""
+    from rq import get_current_job
+
+    current = get_current_job()
+    if current is None:
+        return                      # not under RQ (tests drive handle directly)
+    queue, tries = current.origin, int(job.get("infra_attempts", 0)) + 1
+    reason = f"{type(exc).__name__}: {exc}"[:1000]
+    if tries > INFRA_RETRY_MAX:
+        service.queue.dead_letter(queue, job, f"gave up after {INFRA_RETRY_MAX} retries: {reason}")
+        log.error("job %s dead-lettered on %s: %s", job, queue, reason)
+        return
+    delay = INFRA_RETRY_BASE * 2 ** (tries - 1)
+    service.queue.enqueue(queue, dict(job, infra_attempts=tries), delay,
+                          timeout_seconds=current.timeout)
+    log.warning("job %s failed outside the converter (%s); retry %d of %d in %ds",
+                job, reason, tries, INFRA_RETRY_MAX, delay)
 
 
 class UnknownJob(ValueError):

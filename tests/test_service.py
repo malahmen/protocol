@@ -337,11 +337,26 @@ class RemovalTest(Base):
         self.assertTrue(all(cv.deleted_at for cv in conversions))
         self.assertEqual(self.events[-1], {"event": c.EVENT_REMOVED, "document_id": doc.document_id})
 
-    def test_asking_twice_queues_once(self):
+    def test_asking_again_queues_again_and_the_second_run_changes_nothing(self):
+        # Item 94: a removal stranded by an error (Qdrant or Garage down) stayed
+        # removal_pending, and asking again returned early - for good. Now it
+        # queues again; the cascade is written to run twice.
         doc, _ = self.submit_and_convert()
         self.service.remove(doc.document_id)
         self.service.remove(doc.document_id)
-        self.assertEqual(self.queue.depth(routing.MAINTENANCE_QUEUE), 1)
+        self.assertEqual(self.queue.depth(routing.MAINTENANCE_QUEUE), 2)
+        drain(self.service, self.queue)
+        tomb, _ = self.service.status(doc.document_id)
+        self.assertEqual(tomb.state, c.REMOVED)
+        self.assertEqual([e for e in self.events if e["event"] == c.EVENT_REMOVED],
+                         [{"event": c.EVENT_REMOVED, "document_id": doc.document_id}])
+
+    def test_a_removed_document_asked_again_queues_nothing(self):
+        doc, _ = self.submit_and_convert()
+        self.service.remove(doc.document_id)
+        drain(self.service, self.queue)
+        self.service.remove(doc.document_id)
+        self.assertEqual(self.queue.depth(routing.MAINTENANCE_QUEUE), 0)
 
     def test_a_removed_document_takes_no_more_requests(self):
         doc, _ = self.submit_and_convert()
