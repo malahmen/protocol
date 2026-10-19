@@ -57,7 +57,7 @@ Reading a PDF's facts takes a few milliseconds and needs `pypdfium2` (in `requir
 
 An RQ job names a function by import path, and a worker calls it - so by default anything that can write to Redis can run any importable function in a worker. That is not hypothetical: through a plain RQ `SimpleWorker`, a job naming `os.system` runs, **pickled or JSON**. JSON alone does not close it.
 
-`protocol/redis_backends.py` closes it three ways, and all three must hold: jobs are JSON (a pickled payload does not deserialize); every job protocol enqueues names the one function `protocol.worker.run_job` with a single dict; and `GuardedWorker` checks every job before running anything - that function, one dict, and no success, failure or stopped callback, which RQ would also import and call by name. A job that fails the check is failed without being run, and its callbacks are not run either. `tests/test_redis_backends.py` enqueues each of those against a real Redis and proves nothing ran.
+`protocol/redis_backends.py` closes it three ways, and all three must hold: jobs are JSON (a pickled payload does not deserialize); every job protocol enqueues names the one function `protocol.worker.run_job` with a single dict; and `GuardedWorker` checks every job before running anything - that function, one dict, and no success, failure or stopped callback, webhook or dependency. A job that fails the check is failed without being run. RQ also reaches a job's callbacks and webhooks where no check runs - its registry cleanup calls an expired job's failure callback, and failing a job sends its webhooks - so the queues, the worker, the registries and the sweep load jobs as `GuardedJob`, whose callbacks and webhooks do nothing. `tests/test_redis_backends.py` enqueues each of those against a real Redis and proves nothing ran.
 
 Redis itself stays reachable only by the API and the workers. This is the second wall, not the first.
 
@@ -122,14 +122,14 @@ A converter's worker must run where its engine imports, so the `Containerfile` b
 | `POST /documents` | `202`, or `200` for content it already has | store the source, register it, queue its conversion |
 | `GET /documents/{id}` | `200` | the document and every conversion of it |
 | `POST /documents/{id}/conversions` | `202` | queue a reconversion, with a mode |
-| `DELETE /documents/{id}` | `202` | queue the removal cascade |
+| `DELETE /documents/{id}` | `202` | queue the removal cascade (asking again while it is pending queues it again; a second run finds it removed) |
 | `DELETE /documents/{id}/history` | `202` | queue a history prune (`?keep_alternatives=true` keeps alternatives) |
 | `GET /healthz` | `200` | liveness |
 
 `POST /documents` is multipart: `file`, plus optional `converter` (default `auto`), `options` (a JSON object) and `submitted_by`. \
 The same content again returns the existing document: submission is idempotent, and a reconversion is an explicit request, not a re-upload.
 
-Refusals: `400` for a bad request or option, `404` for an unknown document, `409` for a removed one, `413` over the size cap, `429` with `Retry-After` when that converter's queue is full.
+Refusals: `400` for a bad request or option, `404` for an unknown document (or anything that is not a document ID - 32 lowercase hex characters), `409` for a removed one, `413` over the size cap, `429` with `Retry-After` when that converter's queue is full.
 
 No authentication: the LAN is trusted (decision 15). The API is still the only way in - Redis and the stores are never exposed to callers.
 
@@ -265,6 +265,8 @@ Rules the code keeps, each from the specification:
 - **Jobs are data, never code.** RQ pickles whatever callable it is given, so anything that can write to the queue could run code in a worker. Jobs here are plain dicts naming a kind and an ID; the worker already knows the handler.
 - **At-least-once.** A job may run twice. A conversion writes only under its own folder and clears it first, so a second run overwrites its own first attempt and nothing else.
 - **A dead worker's job is not lost.** A worker killed holding a job (a restart, a reboot, the OOM killer) never reaches the service's error handling, and RQ would only fail the job once its timeout ran out, hours later for a big PDF, without telling protocol. Each worker keeps a short-lived key alive in Redis from a thread; between jobs, every worker sweeps every lane for a job in progress whose worker's key has gone, and hands it back to the service. The lost run counts as a failed attempt, so a source that kills its worker every time is dead-lettered after `PROTOCOL_MAX_ATTEMPTS` instead of looping. Recovery takes about two minutes (`redis_backends.py`).
+- **Trouble around a conversion is retried, then parked.** A job that fails outside the converter - the registry, the store, the index or the queue unreachable for a moment - is queued again after 30 s, doubling, up to six times, then dead-lettered with the reason, so nothing is left `converting` or `removal_pending` with no job. A recovered removal or prune counts its lost runs like a conversion's attempts, and a recovered job is never recovered twice.
+- **The record's ID, not the request's.** A job acts on the document ID the registry holds: MariaDB's collation ignores trailing spaces, and a removal by "<id> " once deleted the source while leaving outputs and vectors behind.
 - **Failures are recorded, not echoed.** The registry keeps the reason for operators; callers see only `conversion failed`.
 - **Idempotent intake.** The registry insert is the uniqueness point: on MariaDB, a unique key on the hash of live documents, so of two concurrent submissions of the same file one insert wins and the other gets the winner back. The source is stored before the row exists, so a row never points at a missing source.
 
