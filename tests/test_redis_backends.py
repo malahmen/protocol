@@ -9,13 +9,22 @@ Needs rq and redis (requirements.txt) and a Redis to point at:
 it can never reach a Redis that holds anything; without the variable these
 checks skip. CI starts a throwaway Redis 7 for them (meksha runs `redis:7`).
 """
+import http.server
 import json
 import os
+import socket
+import sys
 import tempfile
+import threading
 import time
 import unittest
 import zlib
 from unittest import mock
+
+# RQ imports a callback by name, as "test_redis_backends.canary": this folder
+# must be importable however the suite was started, or a callback that runs
+# is not seen.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import helpers
 from protocol import routing
@@ -23,6 +32,7 @@ from protocol.config import Settings
 
 try:
     from rq import Callback, Queue
+    from rq.webhook import Webhook
     from rq.job import Job
     from rq.registry import FailedJobRegistry, ScheduledJobRegistry, StartedJobRegistry
     from rq.serializers import JSONSerializer
@@ -33,12 +43,23 @@ except ImportError:  # pragma: no cover - the stdlib-only run
     HAVE_RQ = False
 
 URL = os.environ.get("PROTOCOL_TEST_REDIS_URL", "")
-CANARY = []
+# A file, not a list: the module RQ imports by name may be a second copy of
+# this one, with a list of its own - a callback that ran would go unseen.
+CANARY = os.path.join(tempfile.gettempdir(), f"protocol-canary-{os.getpid()}")
 
 
 def canary(*args, **kwargs):
-    """Stands in for an attacker's callable: if a refused job reaches it, the list says so."""
-    CANARY.append(args)
+    """Stands in for an attacker's callable: if a refused job reaches it, the file says so."""
+    with open(CANARY, "a") as fh:
+        fh.write(repr(args) + "\n")
+
+
+def canary_calls():
+    try:
+        with open(CANARY) as fh:
+            return fh.read().splitlines()
+    except FileNotFoundError:
+        return []
 
 
 def reachable():
@@ -56,7 +77,9 @@ class RedisCase(unittest.TestCase):
         self.conn = rb.connect(URL)
         self.conn.flushdb()
         self.queue = rb.RQJobQueue(self.conn)
-        CANARY.clear()
+        if os.path.exists(CANARY):
+            os.remove(CANARY)
+        self.addCleanup(lambda: os.path.exists(CANARY) and os.remove(CANARY))
 
     def build(self, settings=None, **converters):
         service, parts, convs = helpers.build(settings, **converters)
@@ -264,7 +287,7 @@ class Refused(RedisCase):
     def assert_refused(self, queue_name):
         self.work(self.service, [queue_name])
         self.assertFalse(os.path.exists(self.proof), "a refused job ran")
-        self.assertEqual(CANARY, [], "a refused job's callable or callback ran")
+        self.assertEqual(canary_calls(), [], "a refused job's callable or callback ran")
         failed = FailedJobRegistry(queue_name, connection=self.conn, serializer=JSONSerializer)
         self.assertEqual(failed.count, 1)
 
@@ -290,6 +313,56 @@ class Refused(RedisCase):
         Queue("convert.markitdown", connection=self.conn, serializer=JSONSerializer) \
             .enqueue(rb.JOB_FUNC, "not a dict")
         self.assert_refused("convert.markitdown")
+
+    def test_a_failure_callback_planted_in_the_started_registry_never_runs(self):
+        # RQ's registry cleanup, every worker's maintenance, calls an expired
+        # in-progress job's failure callback - it never passes through
+        # execute_job (Kamino item 92).
+        q = Queue("convert.markitdown", connection=self.conn, serializer=JSONSerializer)
+        job = q.enqueue("os.getcwd", on_failure=Callback("test_redis_backends.canary"))
+        self.conn.lrem(q.key, 0, job.id)
+        self.conn.zadd(f"rq:wip:{q.name}", {f"{job.id}:planted": 1})
+        self.work(self.service, ["convert.markitdown"])
+        self.assertEqual(canary_calls(), [], "the registry cleanup ran a job's failure callback")
+
+    def _listener(self):
+        hits = []
+
+        class Hook(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):  # noqa: N802
+                hits.append(self.path)
+                self.send_response(200)
+                self.end_headers()
+            do_POST = do_GET  # noqa: N815
+
+            def log_message(self, *args):
+                pass
+
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            port = probe.getsockname()[1]
+        server = http.server.HTTPServer(("127.0.0.1", port), Hook)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.shutdown)
+        return port, hits
+
+    def test_a_refused_jobs_webhooks_are_not_sent(self):
+        port, hits = self._listener()
+        Queue("convert.markitdown", connection=self.conn, serializer=JSONSerializer).enqueue(
+            "os.system", f"touch {self.proof}",
+            webhooks=[Webhook(f"http://127.0.0.1:{port}/forged", "failed")])
+        self.assert_refused("convert.markitdown")
+        time.sleep(0.3)
+        self.assertEqual(hits, [], "a refused job's webhook was sent")
+
+    def test_the_right_function_carrying_a_webhook_is_refused(self):
+        port, hits = self._listener()
+        Queue("convert.markitdown", connection=self.conn, serializer=JSONSerializer).enqueue(
+            rb.JOB_FUNC, {"kind": "convert", "conversion_id": "x"},
+            webhooks=[Webhook(f"http://127.0.0.1:{port}/forged", "finished")])
+        self.assert_refused("convert.markitdown")
+        time.sleep(0.3)
+        self.assertEqual(hits, [])
 
     def test_a_worker_survives_refusing_and_goes_on_working(self):
         Queue("convert.markitdown", connection=self.conn, serializer=JSONSerializer) \
