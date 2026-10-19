@@ -248,10 +248,26 @@ class RecoveryTest(Base):
                     {"kind": "prune", "document_id": "d", "keep_alternatives": False}):
             recover(self.service, job)
         self.assertEqual([j for j, _, _ in self.queue.jobs[routing.MAINTENANCE_QUEUE]],
-                         [{"kind": "remove", "document_id": "d"},
-                          {"kind": "prune", "document_id": "d", "keep_alternatives": False}])
+                         [{"kind": "remove", "document_id": "d", "recoveries": 1},
+                          {"kind": "prune", "document_id": "d", "keep_alternatives": False,
+                           "recoveries": 1}])
         with self.assertRaises(UnknownJob):
             recover(self.service, {"kind": "format-disk"})
+
+    def test_a_removal_that_kills_its_worker_every_time_is_parked(self):
+        # Item 99: conversions stop after max_attempts; removals and prunes
+        # were queued again for ever.
+        job = {"kind": "remove", "document_id": "d"}
+        for _ in range(self.service.settings.max_attempts):
+            recover(self.service, job)
+            pending = self.queue.jobs.get(routing.MAINTENANCE_QUEUE, [])
+            job = pending.pop(0)[0] if pending else None
+            if job is None:
+                break
+        self.assertIsNone(job, "still queued after max_attempts lost runs")
+        ((queue, dead, reason),) = self.queue.dead
+        self.assertEqual((queue, dead["document_id"]), (routing.MAINTENANCE_QUEUE, "d"))
+        self.assertIn(f"died {self.service.settings.max_attempts} times", reason)
 
 
 class ModesTest(Base):
@@ -337,11 +353,26 @@ class RemovalTest(Base):
         self.assertTrue(all(cv.deleted_at for cv in conversions))
         self.assertEqual(self.events[-1], {"event": c.EVENT_REMOVED, "document_id": doc.document_id})
 
-    def test_asking_twice_queues_once(self):
+    def test_asking_again_queues_again_and_the_second_run_changes_nothing(self):
+        # Item 94: a removal stranded by an error (Qdrant or Garage down) stayed
+        # removal_pending, and asking again returned early - for good. Now it
+        # queues again; the cascade is written to run twice.
         doc, _ = self.submit_and_convert()
         self.service.remove(doc.document_id)
         self.service.remove(doc.document_id)
-        self.assertEqual(self.queue.depth(routing.MAINTENANCE_QUEUE), 1)
+        self.assertEqual(self.queue.depth(routing.MAINTENANCE_QUEUE), 2)
+        drain(self.service, self.queue)
+        tomb, _ = self.service.status(doc.document_id)
+        self.assertEqual(tomb.state, c.REMOVED)
+        self.assertEqual([e for e in self.events if e["event"] == c.EVENT_REMOVED],
+                         [{"event": c.EVENT_REMOVED, "document_id": doc.document_id}])
+
+    def test_a_removed_document_asked_again_queues_nothing(self):
+        doc, _ = self.submit_and_convert()
+        self.service.remove(doc.document_id)
+        drain(self.service, self.queue)
+        self.service.remove(doc.document_id)
+        self.assertEqual(self.queue.depth(routing.MAINTENANCE_QUEUE), 0)
 
     def test_a_removed_document_takes_no_more_requests(self):
         doc, _ = self.submit_and_convert()
@@ -373,6 +404,45 @@ class RemovalTest(Base):
         _, (conv,) = self.service.status(doc.document_id)
         self.assertEqual(conv.state, c.CONVERSION_FAILED)
         self.assertEqual(self.store.list("outputs/"), [])
+
+
+class IdTest(Base):
+    """Kamino item 93: an ID is what new_id makes, or nothing at all. On
+    MariaDB (PAD SPACE) "<id> " found the row and the removal deleted by the
+    padded ID: source gone, outputs and vectors left, unreachable for good.
+    These run on the real backends too (test_storage_backends, layer 3)."""
+
+    def bad_ids(self, doc_id):
+        return [doc_id + " ", doc_id + "  ", doc_id.upper(), " " + doc_id, doc_id + "\n", "", "../" + doc_id]
+
+    def test_an_id_that_is_not_one_is_not_found(self):
+        doc, _ = self.submit_and_convert()
+        for bad in self.bad_ids(doc.document_id):
+            with self.subTest(bad=bad):
+                for call in (self.service.status, self.service.remove, self.service.prune,
+                             self.service.reconvert):
+                    with self.assertRaises(NotFound):
+                        call(bad)
+        self.assertEqual(self.queue.depth(routing.MAINTENANCE_QUEUE), 0)
+
+    def test_a_removal_job_naming_a_padded_id_deletes_nothing(self):
+        # A job that reached the queue another way: the cascade never runs on
+        # an ID that is not one.
+        doc, _ = self.submit_and_convert()
+        outputs = self.store.list(c.output_prefix(doc.document_id))
+        self.service.run_removal(doc.document_id + " ")
+        again, _ = self.service.status(doc.document_id)
+        self.assertEqual(again.state, doc.state)
+        self.assertIsNotNone(again.source_key)
+        self.assertEqual(self.store.list(c.output_prefix(doc.document_id)), outputs)
+
+    def test_a_prune_job_naming_a_padded_id_prunes_nothing(self):
+        doc, first = self.submit_and_convert()
+        self.service.reconvert(doc.document_id)
+        drain(self.service, self.queue)
+        self.service.run_prune(doc.document_id + " ")
+        _, conversions = self.service.status(doc.document_id)
+        self.assertFalse(any(cv.role == c.PRUNED for cv in conversions))
 
 
 class PruneTest(Base):

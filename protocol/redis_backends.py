@@ -19,10 +19,17 @@ load-bearing"). Three things close that, and all three must hold:
      queue carries data, never code (ports.JobQueue).
   3. GuardedWorker checks every job before it runs anything: the function
      must be that one, the arguments one dict, and no success, failure or
-     stopped callback may be named - RQ imports and calls a callback by name
-     too. A job that fails the check is failed without being run, and
-     failing it does not run its callbacks (RQ calls those only from inside
-     perform_job, which a refused job never reaches).
+     stopped callback, webhook or dependency may be named - RQ imports and
+     calls a callback by name too. A job that fails the check is failed
+     without being run.
+
+RQ also reaches a job's callbacks and webhooks outside execute_job, where no
+check runs (Kamino item 92, from the 2026-10-19 review): the started-job
+registry's cleanup - every worker's maintenance - calls an expired job's
+failure callback by name, and failing a job, refused or not, sends its
+webhooks. So the queues, the worker, the registries and the sweep all load
+jobs as GuardedJob, whose callbacks and webhooks do nothing: protocol uses
+neither.
 
 Redis itself stays closed to everything but the API and the workers; this is
 the second wall, not the first.
@@ -83,6 +90,7 @@ ALIVE_EVERY = 15                         # how often a live one says otherwise
 SWEEP_EVERY = 60                         # between sweeps, while a worker is idle
 SWEEP_CLAIM_PREFIX = "protocol:sweep:"
 SWEEP_CLAIM_TTL = 300                    # one sweeper per abandoned job
+RECOVERED_CLAIM_TTL = 86400   # a recovered job's claim: no sweep takes it again (item 99)
 
 log = logging.getLogger("protocol.redis_backends")
 
@@ -109,7 +117,7 @@ class RQJobQueue:
         self.connection = connection
 
     def _queue(self, name: str) -> Queue:
-        return Queue(name, connection=self.connection, serializer=JSONSerializer)
+        return Queue(name, connection=self.connection, serializer=JSONSerializer, job_class=GuardedJob)
 
     def enqueue(self, queue: str, job: dict, delay_seconds: int = 0,
                 timeout_seconds: Optional[int] = None) -> None:
@@ -166,6 +174,34 @@ class JobRefused(Exception):
     """A job that is not protocol's: run nothing, fail it."""
 
 
+class GuardedJob(Job):
+    """A Job whose callbacks and webhooks never run (see the module docstring)."""
+
+    @property
+    def success_callback(self):
+        return None
+
+    @property
+    def failure_callback(self):
+        return None
+
+    @property
+    def stopped_callback(self):
+        return None
+
+    def execute_success_callback(self, *args, **kwargs):
+        return None
+
+    def execute_failure_callback(self, *args, **kwargs):
+        return None
+
+    def execute_stopped_callback(self, *args, **kwargs):
+        return None
+
+    def send_webhooks(self, *args, **kwargs):
+        return None
+
+
 def check(job) -> None:
     """Raise JobRefused unless this is a job protocol enqueued. Runs nothing."""
     try:
@@ -180,6 +216,10 @@ def check(job) -> None:
     for which in ("success", "failure", "stopped"):
         if getattr(job, f"_{which}_callback_name", None):
             raise JobRefused(f"names a {which} callback")
+    if getattr(job, "webhooks", None):
+        raise JobRefused("carries webhooks")
+    if getattr(job, "_dependency_ids", None):
+        raise JobRefused("depends on other jobs")
 
 
 class Alive:
@@ -229,7 +269,8 @@ def sweep(connection: Redis, queues: Iterable[str], recover) -> int:
     """
     handed = 0
     for name in queues:
-        registry = StartedJobRegistry(name, connection=connection, serializer=JSONSerializer)
+        registry = StartedJobRegistry(name, connection=connection, serializer=JSONSerializer,
+                                      job_class=GuardedJob)
         for entry in connection.zrange(registry.key, 0, -1):
             entry = entry.decode()
             job_id, _execution_id = parse_composite_key(entry)
@@ -240,7 +281,7 @@ def sweep(connection: Redis, queues: Iterable[str], recover) -> int:
             if not connection.set(claim, "1", nx=True, ex=SWEEP_CLAIM_TTL):
                 continue     # another worker's sweep has it
             try:
-                job = Job.fetch(job_id, connection=connection, serializer=JSONSerializer)
+                job = GuardedJob.fetch(job_id, connection=connection, serializer=JSONSerializer)
                 check(job)
                 payload = job.args[0]
                 recover(payload)
@@ -251,8 +292,16 @@ def sweep(connection: Redis, queues: Iterable[str], recover) -> int:
                 log.exception("could not recover abandoned job %s on %s", job_id, name)
                 connection.delete(claim)
                 continue
-            connection.zrem(registry.key, entry)
-            job.delete(remove_from_queue=True)
+            # Recovered: from here the job must never be recovered again. The
+            # claim is kept for a day first, so a failure in the bookkeeping
+            # below cannot let it expire and a later sweep count a second lost
+            # attempt (Kamino item 99); RQ's own expiry drops a leftover entry.
+            connection.set(claim, "recovered", ex=RECOVERED_CLAIM_TTL)
+            try:
+                connection.zrem(registry.key, entry)
+                job.delete(remove_from_queue=True)
+            except Exception:  # noqa: BLE001 - recovered already; the entry expires on its own
+                log.exception("recovered job %s on %s, but could not clear its RQ record", job_id, name)
             handed += 1
             log.warning("job %s on %s was abandoned by dead worker %s; recovered %s",
                         job_id, name, worker.decode(), json.dumps(payload, sort_keys=True))
@@ -282,6 +331,14 @@ class GuardedWorker(SimpleWorker):
     serializer = JSONSerializer
     death_penalty_class = TimeoutPenalty
     sweep_queues: tuple = ()
+
+    def __init__(self, queues, *args, **kwargs):
+        kwargs["job_class"] = GuardedJob
+        super().__init__(queues, *args, **kwargs)
+        # The registries' cleanup loads jobs with each queue's job_class: set
+        # here, so the guard holds however the queues were built.
+        for q in self.queues:
+            q.job_class = GuardedJob
 
     def execute_job(self, job, queue):
         try:
@@ -316,7 +373,8 @@ def run_worker(service, queues: Iterable[str], connection: Redis, burst: bool = 
     """
     protocol_worker.bind(service)
     names = list(queues)
-    rq_queues = [Queue(n, connection=connection, serializer=JSONSerializer) for n in names]
+    rq_queues = [Queue(n, connection=connection, serializer=JSONSerializer, job_class=GuardedJob)
+                 for n in names]
     w = GuardedWorker(rq_queues, connection=connection, serializer=JSONSerializer,
                       maintenance_interval=SWEEP_EVERY, worker_ttl=SWEEP_EVERY + 15)
     w.sweep_queues = tuple(sweep_queues if sweep_queues is not None else names)

@@ -9,13 +9,22 @@ Needs rq and redis (requirements.txt) and a Redis to point at:
 it can never reach a Redis that holds anything; without the variable these
 checks skip. CI starts a throwaway Redis 7 for them (meksha runs `redis:7`).
 """
+import http.server
 import json
 import os
+import socket
+import sys
 import tempfile
+import threading
 import time
 import unittest
 import zlib
 from unittest import mock
+
+# RQ imports a callback by name, as "test_redis_backends.canary": this folder
+# must be importable however the suite was started, or a callback that runs
+# is not seen.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import helpers
 from protocol import routing
@@ -23,6 +32,7 @@ from protocol.config import Settings
 
 try:
     from rq import Callback, Queue
+    from rq.webhook import Webhook
     from rq.job import Job
     from rq.registry import FailedJobRegistry, ScheduledJobRegistry, StartedJobRegistry
     from rq.serializers import JSONSerializer
@@ -33,12 +43,23 @@ except ImportError:  # pragma: no cover - the stdlib-only run
     HAVE_RQ = False
 
 URL = os.environ.get("PROTOCOL_TEST_REDIS_URL", "")
-CANARY = []
+# A file, not a list: the module RQ imports by name may be a second copy of
+# this one, with a list of its own - a callback that ran would go unseen.
+CANARY = os.path.join(tempfile.gettempdir(), f"protocol-canary-{os.getpid()}")
 
 
 def canary(*args, **kwargs):
-    """Stands in for an attacker's callable: if a refused job reaches it, the list says so."""
-    CANARY.append(args)
+    """Stands in for an attacker's callable: if a refused job reaches it, the file says so."""
+    with open(CANARY, "a") as fh:
+        fh.write(repr(args) + "\n")
+
+
+def canary_calls():
+    try:
+        with open(CANARY) as fh:
+            return fh.read().splitlines()
+    except FileNotFoundError:
+        return []
 
 
 def reachable():
@@ -56,7 +77,9 @@ class RedisCase(unittest.TestCase):
         self.conn = rb.connect(URL)
         self.conn.flushdb()
         self.queue = rb.RQJobQueue(self.conn)
-        CANARY.clear()
+        if os.path.exists(CANARY):
+            os.remove(CANARY)
+        self.addCleanup(lambda: os.path.exists(CANARY) and os.remove(CANARY))
 
     def build(self, settings=None, **converters):
         service, parts, convs = helpers.build(settings, **converters)
@@ -127,6 +150,59 @@ class ThroughTheService(RedisCase):
         self.assertEqual(self.queue.depth("convert.markitdown"), 0)
         ((_id, fields),) = self.conn.xrange(rb.EVENTS_STREAM)
         self.assertEqual(json.loads(fields[b"data"])["conversion_id"], conv.conversion_id)
+
+    def _no_delay(self):
+        # The infra retry's delay, and the service's own: 0, so a burst worker
+        # reaches the requeued job.
+        from protocol import worker as protocol_worker
+        patcher = mock.patch.object(protocol_worker, "INFRA_RETRY_BASE", 0, create=True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return Settings(retry_base_seconds=0)
+
+    def test_a_store_blip_outside_the_converter_is_retried_not_stranded(self):
+        # Item 94: the converter fails, then Garage blips while its partial
+        # output is cleared - outside the converter's try. RQ failed the job,
+        # the worker was alive, and the conversion stayed `converting` for good.
+        service, parts, _ = self.build(self._no_delay(),
+                                       markitdown=helpers.FakeConverter("markitdown", fail_times=1))
+        store, real, calls = parts["store"], parts["store"].delete_prefix, []
+
+        def blip(prefix):
+            calls.append(prefix)
+            if len(calls) == 1:
+                raise ConnectionError("garage blip")
+            return real(prefix)
+        store.delete_prefix = blip
+        doc, conv, _ = service.submit(b"PK", "notes.docx")
+        self.work(service, routing.worker_queues("markitdown"))
+        conv = parts["registry"].get_conversion(conv.conversion_id)
+        self.assertEqual(conv.state, "validation_pending")
+
+    def test_a_removal_blip_is_retried(self):
+        service, parts, _ = self.build(self._no_delay())
+        doc, _, _ = service.submit(b"PK", "notes.docx")
+        self.work(service, routing.worker_queues("markitdown"))
+        index, real, calls = parts["index"], parts["index"].delete_document, []
+
+        def blip(document_id):
+            calls.append(document_id)
+            if len(calls) == 1:
+                raise ConnectionError("qdrant blip")
+            return real(document_id)
+        index.delete_document = blip
+        service.remove(doc.document_id)
+        self.work(service, [routing.MAINTENANCE_QUEUE])
+        self.assertEqual(service.status(doc.document_id)[0].state, "removed")
+
+    def test_a_job_that_fails_outside_the_converter_every_time_is_dead_lettered(self):
+        service, parts, _ = self.build(self._no_delay())
+        doc, conv, _ = service.submit(b"PK", "notes.docx")
+        parts["registry"].save_conversion = mock.Mock(side_effect=ConnectionError("mariadb down"))
+        self.work(service, routing.worker_queues("markitdown"))
+        (dead,) = self.queue.dead_letters("convert.markitdown")
+        self.assertIn("gave up after 6 retries: ConnectionError: mariadb down", dead["reason"])
+        self.assertEqual(self.queue.depth("convert.markitdown"), 0)
 
     def test_a_marker_worker_takes_the_light_lane_first(self):
         service, _, convs = self.build()
@@ -200,6 +276,19 @@ class Abandoned(RedisCase):
         self.assertEqual(self.queue.depth(lane), 1)                 # the retry, delayed
         self.assertEqual(self.sweep(service), 0)                    # and only once
 
+    def test_a_recovered_job_is_never_recovered_again_even_if_its_cleanup_fails(self):
+        # Item 99: zrem/job.delete raising after recover() used to escape the
+        # sweep, and the 300 s claim then expired: a later sweep recovered the
+        # job again and counted a second lost attempt.
+        lane = routing.QUEUES["markitdown"]
+        service, parts, _ = self.build(markitdown=helpers.FakeConverter("markitdown", on_convert=die))
+        doc, conv, _ = service.submit(b"PK", "notes.docx")
+        _w, job = self.take_and_die(service, lane)
+        with mock.patch.object(rb.GuardedJob, "delete", side_effect=ConnectionError("redis blip")):
+            self.assertEqual(self.sweep(service), 1)
+        self.assertGreater(self.conn.ttl(rb.SWEEP_CLAIM_PREFIX + job.id), rb.SWEEP_CLAIM_TTL)
+        self.assertEqual(parts["registry"].get_conversion(conv.conversion_id).attempts, 1)
+
     def test_a_live_workers_job_is_left_alone(self):
         lane = routing.QUEUES["markitdown"]
         service, parts, _ = self.build(markitdown=helpers.FakeConverter("markitdown", on_convert=die))
@@ -264,7 +353,7 @@ class Refused(RedisCase):
     def assert_refused(self, queue_name):
         self.work(self.service, [queue_name])
         self.assertFalse(os.path.exists(self.proof), "a refused job ran")
-        self.assertEqual(CANARY, [], "a refused job's callable or callback ran")
+        self.assertEqual(canary_calls(), [], "a refused job's callable or callback ran")
         failed = FailedJobRegistry(queue_name, connection=self.conn, serializer=JSONSerializer)
         self.assertEqual(failed.count, 1)
 
@@ -290,6 +379,56 @@ class Refused(RedisCase):
         Queue("convert.markitdown", connection=self.conn, serializer=JSONSerializer) \
             .enqueue(rb.JOB_FUNC, "not a dict")
         self.assert_refused("convert.markitdown")
+
+    def test_a_failure_callback_planted_in_the_started_registry_never_runs(self):
+        # RQ's registry cleanup, every worker's maintenance, calls an expired
+        # in-progress job's failure callback - it never passes through
+        # execute_job (Kamino item 92).
+        q = Queue("convert.markitdown", connection=self.conn, serializer=JSONSerializer)
+        job = q.enqueue("os.getcwd", on_failure=Callback("test_redis_backends.canary"))
+        self.conn.lrem(q.key, 0, job.id)
+        self.conn.zadd(f"rq:wip:{q.name}", {f"{job.id}:planted": 1})
+        self.work(self.service, ["convert.markitdown"])
+        self.assertEqual(canary_calls(), [], "the registry cleanup ran a job's failure callback")
+
+    def _listener(self):
+        hits = []
+
+        class Hook(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):  # noqa: N802
+                hits.append(self.path)
+                self.send_response(200)
+                self.end_headers()
+            do_POST = do_GET  # noqa: N815
+
+            def log_message(self, *args):
+                pass
+
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            port = probe.getsockname()[1]
+        server = http.server.HTTPServer(("127.0.0.1", port), Hook)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.shutdown)
+        return port, hits
+
+    def test_a_refused_jobs_webhooks_are_not_sent(self):
+        port, hits = self._listener()
+        Queue("convert.markitdown", connection=self.conn, serializer=JSONSerializer).enqueue(
+            "os.system", f"touch {self.proof}",
+            webhooks=[Webhook(f"http://127.0.0.1:{port}/forged", "failed")])
+        self.assert_refused("convert.markitdown")
+        time.sleep(0.3)
+        self.assertEqual(hits, [], "a refused job's webhook was sent")
+
+    def test_the_right_function_carrying_a_webhook_is_refused(self):
+        port, hits = self._listener()
+        Queue("convert.markitdown", connection=self.conn, serializer=JSONSerializer).enqueue(
+            rb.JOB_FUNC, {"kind": "convert", "conversion_id": "x"},
+            webhooks=[Webhook(f"http://127.0.0.1:{port}/forged", "finished")])
+        self.assert_refused("convert.markitdown")
+        time.sleep(0.3)
+        self.assertEqual(hits, [])
 
     def test_a_worker_survives_refusing_and_goes_on_working(self):
         Queue("convert.markitdown", connection=self.conn, serializer=JSONSerializer) \

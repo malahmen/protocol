@@ -60,6 +60,17 @@ def new_id() -> str:
     return uuid.uuid4().hex
 
 
+# What new_id makes. Anything else is refused before the registry sees it:
+# MariaDB's utf8mb4_bin is a PAD SPACE collation, so "<id> " found the row,
+# and the removal then deleted Qdrant points and S3 outputs under the padded
+# ID - none - while the source and the record went (Kamino item 93).
+_ID = re.compile(r"[0-9a-f]{32}")
+
+
+def is_id(value) -> bool:
+    return isinstance(value, str) and _ID.fullmatch(value) is not None
+
+
 def safe_name(name: str) -> str:
     """The original name, reduced to one harmless path segment."""
     base = _CONTROL.sub("", (name or "").replace("\\", "/").split("/")[-1]).strip()
@@ -150,18 +161,21 @@ class ConversionService:
                            timeout_seconds=timeout)
         return stored, conv, True
 
-    def status(self, document_id: str) -> tuple[c.Document, list[c.Conversion]]:
-        doc = self.registry.get_document(document_id)
+    def _known(self, document_id: str) -> c.Document:
+        """The document, or NotFound - also for anything that is not an ID."""
+        doc = self.registry.get_document(document_id) if is_id(document_id) else None
         if doc is None:
             raise NotFound(document_id)
-        return doc, self.registry.conversions_of(document_id)
+        return doc
+
+    def status(self, document_id: str) -> tuple[c.Document, list[c.Conversion]]:
+        doc = self._known(document_id)
+        return doc, self.registry.conversions_of(doc.document_id)
 
     def _live(self, document_id: str) -> c.Document:
-        doc = self.registry.get_document(document_id)
-        if doc is None:
-            raise NotFound(document_id)
+        doc = self._known(document_id)
         if not doc.live:
-            raise Conflict(f"document {document_id} is {doc.state}")
+            raise Conflict(f"document {doc.document_id} is {doc.state}")
         return doc
 
     def reconvert(self, document_id: str, mode: str = c.DEFAULT_MODE,
@@ -175,7 +189,7 @@ class ConversionService:
         data = self.store.get(doc.source_key) if chosen == "marker" else None
         queue, timeout = self._plan(chosen, doc.original_name, data, opts)
         self._admit(queue)
-        conv = c.Conversion(conversion_id=new_id(), document_id=document_id, mode=mode,
+        conv = c.Conversion(conversion_id=new_id(), document_id=doc.document_id, mode=mode,
                             converter=chosen, options=opts)
         self.registry.add_conversion(conv)
         self.queue.enqueue(queue, {"kind": "convert", "conversion_id": conv.conversion_id},
@@ -183,20 +197,24 @@ class ConversionService:
         return conv
 
     def remove(self, document_id: str) -> c.Document:
-        """Queue the removal cascade. Asking twice is the same request."""
-        doc = self.registry.get_document(document_id)
-        if doc is None:
-            raise NotFound(document_id)
-        if doc.state in (c.REMOVAL_PENDING, c.REMOVED):
+        """Queue the removal cascade. Asking again while it is pending queues it
+        again: a removal stranded by an error could otherwise never be asked
+        for (Kamino item 94), and a second run finds it removed and does
+        nothing."""
+        doc = self._known(document_id)
+        if doc.state == c.REMOVED:
+            return doc
+        if doc.state == c.REMOVAL_PENDING:
+            self.queue.enqueue(routing.MAINTENANCE_QUEUE, {"kind": "remove", "document_id": doc.document_id})
             return doc
         doc.state = c.REMOVAL_PENDING
         self.registry.save_document(doc)
-        self.queue.enqueue(routing.MAINTENANCE_QUEUE, {"kind": "remove", "document_id": document_id})
+        self.queue.enqueue(routing.MAINTENANCE_QUEUE, {"kind": "remove", "document_id": doc.document_id})
         return doc
 
     def prune(self, document_id: str, keep_alternatives: bool = False) -> c.Document:
         doc = self._live(document_id)
-        self.queue.enqueue(routing.MAINTENANCE_QUEUE, {"kind": "prune", "document_id": document_id,
+        self.queue.enqueue(routing.MAINTENANCE_QUEUE, {"kind": "prune", "document_id": doc.document_id,
                                                        "keep_alternatives": bool(keep_alternatives)})
         return doc
 
@@ -369,9 +387,12 @@ class ConversionService:
         return (json.dumps(record, indent=2, sort_keys=True) + "\n").encode()
 
     def run_removal(self, document_id: str) -> None:
-        doc = self.registry.get_document(document_id)
+        doc = self.registry.get_document(document_id) if is_id(document_id) else None
         if doc is None or doc.state == c.REMOVED:
             return
+        # The record's spelling from here on, never the job's: the cascade
+        # deletes by this ID (Kamino item 93).
+        document_id = doc.document_id
         # Index first, then outputs, then source: a removal that stops halfway
         # leaves files without vectors, never vectors pointing at nothing.
         self.index.delete_document(document_id)
@@ -395,9 +416,10 @@ class ConversionService:
         self.events.append({"event": c.EVENT_REMOVED, "document_id": document_id})
 
     def run_prune(self, document_id: str, keep_alternatives: bool = False) -> None:
-        doc = self.registry.get_document(document_id)
+        doc = self.registry.get_document(document_id) if is_id(document_id) else None
         if doc is None or not doc.live:
             return
+        document_id = doc.document_id
         pruned = []
         for conv in self.registry.conversions_of(document_id):
             if conv.deleted_at is not None or conv.conversion_id == doc.current_conversion_id:

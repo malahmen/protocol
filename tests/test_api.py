@@ -59,6 +59,17 @@ class ApiTest(unittest.TestCase):
         self.assertEqual((r.status_code, r.json()["state"]), (202, "removal_pending"))
         self.assertEqual(self.client.post(f"/documents/{doc_id}/conversions", json={}).status_code, 409)
 
+    def test_a_padded_id_is_not_found(self):
+        # Kamino item 93: "<id> " matched the row on MariaDB (PAD SPACE).
+        doc_id = self.upload().json()["document_id"]
+        drain(self.service, self.parts["queue"])
+        for path in (f"/documents/{doc_id}%20", f"/documents/{doc_id.upper()}"):
+            with self.subTest(path=path):
+                self.assertEqual(self.client.delete(path).status_code, 404)
+                self.assertEqual(self.client.get(path).status_code, 404)
+        state = self.client.get(f"/documents/{doc_id}").json()["document"]["state"]
+        self.assertNotIn(state, ("removal_pending", "removed"))
+
     def test_errors(self):
         self.assertEqual(self.client.get("/documents/nope").status_code, 404)
         self.assertEqual(self.upload(options="{not json").status_code, 400)
