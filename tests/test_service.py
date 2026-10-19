@@ -375,6 +375,45 @@ class RemovalTest(Base):
         self.assertEqual(self.store.list("outputs/"), [])
 
 
+class IdTest(Base):
+    """Kamino item 93: an ID is what new_id makes, or nothing at all. On
+    MariaDB (PAD SPACE) "<id> " found the row and the removal deleted by the
+    padded ID: source gone, outputs and vectors left, unreachable for good.
+    These run on the real backends too (test_storage_backends, layer 3)."""
+
+    def bad_ids(self, doc_id):
+        return [doc_id + " ", doc_id + "  ", doc_id.upper(), " " + doc_id, doc_id + "\n", "", "../" + doc_id]
+
+    def test_an_id_that_is_not_one_is_not_found(self):
+        doc, _ = self.submit_and_convert()
+        for bad in self.bad_ids(doc.document_id):
+            with self.subTest(bad=bad):
+                for call in (self.service.status, self.service.remove, self.service.prune,
+                             self.service.reconvert):
+                    with self.assertRaises(NotFound):
+                        call(bad)
+        self.assertEqual(self.queue.depth(routing.MAINTENANCE_QUEUE), 0)
+
+    def test_a_removal_job_naming_a_padded_id_deletes_nothing(self):
+        # A job that reached the queue another way: the cascade never runs on
+        # an ID that is not one.
+        doc, _ = self.submit_and_convert()
+        outputs = self.store.list(c.output_prefix(doc.document_id))
+        self.service.run_removal(doc.document_id + " ")
+        again, _ = self.service.status(doc.document_id)
+        self.assertEqual(again.state, doc.state)
+        self.assertIsNotNone(again.source_key)
+        self.assertEqual(self.store.list(c.output_prefix(doc.document_id)), outputs)
+
+    def test_a_prune_job_naming_a_padded_id_prunes_nothing(self):
+        doc, first = self.submit_and_convert()
+        self.service.reconvert(doc.document_id)
+        drain(self.service, self.queue)
+        self.service.run_prune(doc.document_id + " ")
+        _, conversions = self.service.status(doc.document_id)
+        self.assertFalse(any(cv.role == c.PRUNED for cv in conversions))
+
+
 class PruneTest(Base):
     def setUp(self):
         super().setUp()

@@ -450,8 +450,12 @@ def _on_real_backends(case):
     return unittest.skipUnless(S3_UP and DB_UP, "needs both Garage and MariaDB")(OnRealBackends)
 
 
+# Every class in test_service.py: a list kept by hand had left RecoveryTest
+# out (item 87's recovery never ran on MariaDB) - IdTest is item 93's, whose
+# bug exists only there.
 for _case in (test_service.SubmitTest, test_service.ConversionTest, test_service.ModesTest,
-              test_service.RemovalTest, test_service.PruneTest):
+              test_service.RemovalTest, test_service.PruneTest, test_service.RecoveryTest,
+              test_service.IdTest):
     globals()[_case.__name__ + "OnRealBackends"] = _on_real_backends(_case)
 del _case
 
