@@ -13,6 +13,13 @@ Rates measured on corelia, idle, 2026-10-16 (marker 2.0.0, 32 CPUs, no GPU):
 includes the table OCR a text PDF still pays). A page needs OCR when the PDF
 has no text layer, when it is an image, or when the request forces it.
 
+Transcription has no pages: its cost is the audio's length. Whisper
+large-v3-turbo on corelia's CPU (16 threads, int8) took 0.094 s per second of
+audio, 2026-10-18 (Kamino item 68), and the job's allowance is ~3x that per
+minute, plus the base. The length is read with the standard library for a WAV
+and with mutagen for anything else, when it is installed (the API's image has
+it); unread, the job gets the unknown allowance.
+
 The estimate reads the PDF with pypdfium2 when it is installed (the API
 process has it). Without it, or for a file it cannot read, nothing is known,
 and an unknown job is treated as heavy: the light queue's promise is that
@@ -31,14 +38,40 @@ _TEXT_LAYER_MIN_CHARS = 50
 _SAMPLE_PAGES = 3
 
 
+TRANSCRIPTION_SECONDS_PER_AUDIO_SECOND = 0.094
+
+
 @dataclass(frozen=True)
 class Estimate:
     pages: Optional[int]          # pages that will be converted; None = unknown
     needs_ocr: bool
     seconds: Optional[float]      # None = unknown
+    audio_seconds: Optional[float] = None   # a recording's length; None = not audio, or unknown
 
 
 UNKNOWN = Estimate(None, True, None)
+
+
+def audio_seconds(data: bytes) -> Optional[float]:
+    """A recording's length in seconds, or None if it cannot be read."""
+    import io
+    import wave
+    try:
+        with wave.open(io.BytesIO(data)) as w:
+            if w.getframerate() > 0:
+                return w.getnframes() / w.getframerate()
+    except (wave.Error, EOFError, ValueError):
+        pass
+    try:
+        import mutagen
+    except ImportError:
+        return None
+    try:
+        info = mutagen.File(io.BytesIO(data))
+        length = getattr(getattr(info, "info", None), "length", None)
+    except Exception:  # noqa: BLE001 - an unreadable file is only an unknown cost here
+        return None
+    return float(length) if length and length > 0 else None
 
 
 def _range_indices(spec: str) -> list[int]:
@@ -83,7 +116,13 @@ def pdf_facts(data: bytes, page_range: Optional[str] = None) -> tuple[Optional[i
 
 
 def estimate(converter: str, original_name: str, data: Optional[bytes], options: dict) -> Estimate:
-    """What converting this will cost. Only marker's cost varies enough to plan for."""
+    """What converting this will cost: marker's by its pages, a transcription's
+    by its length. markitdown's is too small to plan for."""
+    if converter == "transcription":
+        length = audio_seconds(data) if data is not None else None
+        if length is None:
+            return Estimate(None, False, None)
+        return Estimate(None, False, length * TRANSCRIPTION_SECONDS_PER_AUDIO_SECOND, length)
     if converter != "marker":
         return Estimate(None, False, None)
     forced = bool(options.get("force_ocr"))
@@ -111,13 +150,17 @@ def queue(converter: str, est: Estimate, heavy_seconds: int) -> str:
     return routing.MARKER_LIGHT_QUEUE
 
 
-def timeout(est: Estimate, base: int, per_page: int, unknown: int) -> int:
+def timeout(est: Estimate, base: int, per_page: int, unknown: int,
+            per_audio_minute: int = 18) -> int:
     """Seconds the job may run before it is stopped.
 
     A budget per page of ~3x the OCR rate leaves room for a slower node and a
     busy host; the base covers what a job can owe once (a cold model cache
-    downloads the OCR weights inside the first job).
+    downloads the OCR weights inside the first job). A recording gets the
+    same base and ~3x Whisper's rate per minute of audio.
     """
+    if est.audio_seconds is not None:
+        return base + int(est.audio_seconds * per_audio_minute / 60 + 0.999)
     if est.pages is None:
         return unknown
     return base + est.pages * per_page

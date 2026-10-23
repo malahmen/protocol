@@ -13,6 +13,10 @@
 | `PROTOCOL_JOB_TIMEOUT_BASE`    | 1800         | every job's allowance before its pages                |
 | `PROTOCOL_JOB_TIMEOUT_PER_PAGE`| 180          | per page: ~3x OCR's measured 54.7 s/page              |
 | `PROTOCOL_JOB_TIMEOUT_UNKNOWN` | 21600        | a job whose page count cannot be known (6 h)          |
+| `PROTOCOL_JOB_TIMEOUT_PER_AUDIO_MINUTE` | 18  | per minute of audio: ~3x Whisper's measured 0.094 s/s |
+| `SPEACHES_URL`                 | unset        | set = audio is accepted and transcribed by Speaches there; unset = audio is refused at submit |
+| `SPEACHES_MODEL`               | deepdml/faster-whisper-large-v3-turbo-ct2 | the model a request names none of |
+| `SPEACHES_API_KEY`             | unset        | sent as a bearer token, if Speaches was started with one |
 """
 import os
 from dataclasses import dataclass
@@ -44,6 +48,8 @@ class Settings:
     job_timeout_base: int = 1800
     job_timeout_per_page: int = 180
     job_timeout_unknown: int = 21600
+    job_timeout_per_audio_minute: int = 18
+    transcription_configured: bool = False
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -59,4 +65,7 @@ class Settings:
             job_timeout_base=_int("PROTOCOL_JOB_TIMEOUT_BASE", cls.job_timeout_base),
             job_timeout_per_page=_int("PROTOCOL_JOB_TIMEOUT_PER_PAGE", cls.job_timeout_per_page),
             job_timeout_unknown=_int("PROTOCOL_JOB_TIMEOUT_UNKNOWN", cls.job_timeout_unknown),
+            job_timeout_per_audio_minute=_int("PROTOCOL_JOB_TIMEOUT_PER_AUDIO_MINUTE",
+                                              cls.job_timeout_per_audio_minute),
+            transcription_configured=bool(os.environ.get("SPEACHES_URL", "").strip()),
         )

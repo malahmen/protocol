@@ -27,7 +27,7 @@ The contract is built and tested, and so is every adapter: the converters, the q
 | Source and output stores on Garage (taris) | **built** (`protocol/s3_store.py`); the buckets `protocol-sources` and `protocol-outputs` exist on the NAS |
 | Queues (RQ) and the completion stream (Redis Stream), on a Redis of protocol's own on meksha (port 6380, with a password) | **built** (`protocol/redis_backends.py`): JSON jobs, one job function, a worker that refuses any other |
 | Qdrant removal by document and by conversion | **built** (`protocol/qdrant_index.py`) |
-| The converters: marker and markitdown, in protocol-droid's two images (`protocol/converters.py`) | **built**; transcription through Speaches waits on item 68 (running Speaches on corelia, and measuring it) |
+| The converters: marker and markitdown, in protocol-droid's two images; transcription through Speaches over HTTP (`protocol/converters.py`) | **built** |
 | Running it: the API and a worker per lane, from the environment (`protocol/deploy.py`), in images (`Containerfile`) | **built** |
 | Install and management on corelia | **built**: scomp-link's `protocol/protocol.sh` |
 
@@ -50,6 +50,8 @@ Before a marker job is queued, `protocol/cost.py` estimates how long it will run
 Over `PROTOCOL_MARKER_HEAVY_SECONDS` (five minutes) it waits in `convert.marker.heavy`, otherwise in `convert.marker.light`, each with its own worker - more workers on one CPU host would only share its threads. **Anything whose cost cannot be read counts as heavy**: the light lane's promise is that nothing slow is in it. The same estimate sizes the job's timeout, and a retry is planned again from the same source, so it returns to its lane. **A timeout is final**: the allowance is about three times the measured rate, so a job that uses it all was misjudged or is stuck, and a retry would hold the lane as long again. It fails at once and is dead-lettered; reconvert it with a `page_range`, or with a larger `PROTOCOL_JOB_TIMEOUT_*`.
 
 Reading a PDF's facts takes a few milliseconds and needs `pypdfium2` (in `requirements.txt`); the core runs without it, and then every PDF is an unknown cost.
+
+A recording has no pages: its cost is its length. Whisper large-v3-turbo on corelia's CPU took **0.094 s per second of audio** (Kamino item 68), so an hour of audio is about six minutes, and its allowance is the base plus `PROTOCOL_JOB_TIMEOUT_PER_AUDIO_MINUTE` (18 s, ~3x) per minute. The length of a WAV is read with the standard library and of anything else with `mutagen` (in `requirements.txt`); a recording neither can read gets the unknown allowance. Transcription has one queue and one worker: Speaches does the work, so a second worker would only queue in Speaches instead.
 
 ---
 
@@ -107,11 +109,11 @@ curl -s -X DELETE localhost:8080/documents/<id>                 # 202, the remov
 ```sh
 python -m protocol.deploy check                 # every backend reachable? one line each, no credentials
 python -m protocol.deploy api --port 8080       # the HTTP API; creates the registry's tables first
-python -m protocol.deploy worker marker-light   # one worker: marker-light, marker-heavy, markitdown, maintenance
+python -m protocol.deploy worker marker-light   # one worker: marker-light, marker-heavy, markitdown, transcription, maintenance
 python -m protocol.deploy queues                # each queue's depth and dead letters, and its worker
 ```
 
-A converter's worker must run where its engine imports, so the `Containerfile` builds three images from one recipe: the API's on plain Python, and protocol on top of protocol-droid's `marker-service` and `markitdown-service` for the two converters' workers (`--build-arg BASE=...`). On corelia, scomp-link's `protocol.sh` builds them from source, holds the credentials as podman secrets, and runs each part as a systemd user service.
+A converter's worker must run where its engine imports, so the `Containerfile` builds three images from one recipe: the API's on plain Python, and protocol on top of protocol-droid's `marker-service` and `markitdown-service` for the two converters' workers (`--build-arg BASE=...`). The transcription worker runs in the API's image: it calls Speaches over HTTP, so there is no engine to import and no Whisper in it. On corelia, scomp-link's `protocol.sh` builds them from source, holds the credentials as podman secrets, and runs each part as a systemd user service.
 
 ---
 
@@ -143,6 +145,7 @@ No authentication: the LAN is trusted (decision 15). The API is still the only w
 
 Options are allowlisted: anything else is a `400`, so a request never reaches a converter's flags directly. \
 `use_llm` is accepted only where an LLM is configured, and the endpoint is the deployment's, never the request's - a caller who can name a URL can aim the service at anything. \
+Audio is accepted only where `SPEACHES_URL` is set: elsewhere it is a `400` at submit, rather than a conversion queued where nothing would ever take it. A transcription writes `<name>.md` (the text) and `<name>.transcript.json` (Speaches' answer: language, duration, timed segments); `model` and `language` go to Speaches as given, and without `language` Whisper detects it. \
 `page_range` is capped, not just parsed: an unbounded range once took protocol-droid's worker down with the job.
 
 Rendering - Markdown to PDF or DOCX with pandoc and xelatex - is not here: it stays holo-convert's, locally or in its container (Kamino decisions 3-4).
@@ -212,6 +215,10 @@ Removal runs **index, then outputs, then source**, so a removal that stops halfw
 | `PROTOCOL_JOB_TIMEOUT_BASE` | `1800` | every job's allowance before its pages |
 | `PROTOCOL_JOB_TIMEOUT_PER_PAGE` | `180` | per page: ~3x OCR's measured 54.7 s/page |
 | `PROTOCOL_JOB_TIMEOUT_UNKNOWN` | `21600` | a job whose page count cannot be known (6 h) |
+| `PROTOCOL_JOB_TIMEOUT_PER_AUDIO_MINUTE` | `18` | per minute of audio: ~3x Whisper's measured 0.094 s/s |
+| `SPEACHES_URL` | unset | set: audio is accepted and transcribed by Speaches there (`http://192.168.3.46:8000` on corelia). Needed by the API (to accept audio) and the transcription worker |
+| `SPEACHES_MODEL` | `deepdml/faster-whisper-large-v3-turbo-ct2` | the model used when a request names none |
+| `SPEACHES_API_KEY` | unset | sent as a bearer token, if Speaches was started with one |
 
 The backends:
 

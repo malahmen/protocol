@@ -67,7 +67,14 @@ class OptionsTest(unittest.TestCase):
             with self.assertRaises(InvalidRequest, msg=bad):
                 self.check("marker", {"page_range": bad})
 
+    def test_audio_is_refused_where_nothing_transcribes(self):
+        # Queued anyway, it waited in convert.transcription for good (item 89).
+        with self.assertRaises(InvalidRequest) as cm:
+            routing.validate_options("transcription", {}, Settings())
+        self.assertIn("SPEACHES_URL", str(cm.exception))
+
     def test_transcription_options(self):
+        self.settings = Settings(transcription_configured=True)
         self.assertEqual(self.check("transcription", {"model": "Systran/faster-whisper-large-v3",
                                                       "language": "pt-PT"})["language"], "pt-PT")
         for bad in ({"model": "a b"}, {"model": "x" * 300}, {"language": "portuguese"},

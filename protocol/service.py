@@ -111,7 +111,8 @@ class ConversionService:
         est = cost.estimate(converter, name, data, options)
         s = self.settings
         return (cost.queue(converter, est, s.marker_heavy_seconds),
-                cost.timeout(est, s.job_timeout_base, s.job_timeout_per_page, s.job_timeout_unknown))
+                cost.timeout(est, s.job_timeout_base, s.job_timeout_per_page, s.job_timeout_unknown,
+                             s.job_timeout_per_audio_minute))
 
     def _admit(self, queue: str) -> None:
         """Backpressure: refuse new work for a queue that is already full."""

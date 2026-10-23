@@ -43,8 +43,14 @@ class SubmitTest(Base):
         self.assertEqual(self.queue.depth(routing.MARKER_HEAVY_QUEUE), 1)
 
     def test_audio_is_queued_for_transcription(self):
-        self.service.submit(b"RIFF", "meeting.wav")
-        self.assertEqual(self.queue.depth("convert.transcription"), 1)
+        service, parts, _ = helpers.build(Settings(transcription_configured=True))
+        service.submit(b"RIFF", "meeting.wav")
+        self.assertEqual(parts["queue"].depth("convert.transcription"), 1)
+
+    def test_audio_is_refused_where_nothing_transcribes(self):
+        with self.assertRaises(routing.InvalidRequest):
+            self.service.submit(b"RIFF", "meeting.wav")
+        self.assertEqual(self.queue.depth("convert.transcription"), 0)
 
     def test_the_same_content_is_the_same_document(self):
         first, _, _ = self.service.submit(PDF, "a.pdf")
