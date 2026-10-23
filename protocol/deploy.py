@@ -39,7 +39,7 @@ from typing import Optional
 
 from . import mariadb_registry, redis_backends, routing, s3_store
 from .config import Settings
-from .converters import EngineConverter
+from .converters import converter_for
 from .qdrant_index import QdrantIndex
 from .service import ConversionService
 
@@ -50,6 +50,9 @@ WORKERS = {
     "marker-light": ("marker", (routing.MARKER_LIGHT_QUEUE,)),
     "marker-heavy": ("marker", (routing.MARKER_HEAVY_QUEUE,)),
     "markitdown": ("markitdown", (routing.QUEUES["markitdown"],)),
+    # Speaches does the work, over HTTP: this worker needs no engine in its
+    # image, only SPEACHES_URL (Kamino item 89).
+    "transcription": ("transcription", (routing.QUEUES["transcription"],)),
     "maintenance": (None, (routing.MAINTENANCE_QUEUE,)),
 }
 
@@ -78,7 +81,7 @@ def index_from_env():
 def build(converter: Optional[str] = None) -> ConversionService:
     """The service on the real backends, with `converter`'s engine if named."""
     redis = redis_backends.connect()
-    converters = {converter: EngineConverter(converter)} if converter else {}
+    converters = {converter: converter_for(converter)} if converter else {}
     return ConversionService(
         registry=mariadb_registry.MariaDBRegistry(),
         store=s3_store.S3Store(s3_store.connect(), s3_store.buckets_from_env()),
@@ -154,6 +157,16 @@ def _s3_check() -> str:
     return "reachable; buckets " + ", ".join(buckets.values())
 
 
+def _speaches_check() -> str:
+    url = os.environ.get("SPEACHES_URL", "").strip().rstrip("/")
+    if not url:
+        return "not configured (SPEACHES_URL is not set): audio is refused at submit"
+    conv = converter_for("transcription")
+    listed = {m.get("id") for m in conv._call("/v1/models").get("data", [])}
+    return "reachable; " + (f"model {conv.model}" if conv.model in listed
+                            else f"WARNING: does not list {conv.model}")
+
+
 def _redis_check() -> str:
     redis_backends.connect().ping()
     return "reachable"
@@ -172,15 +185,22 @@ def queues() -> int:
 
 
 def check() -> int:
-    """One line per backend, without a credential in any of them. 0 = all reachable."""
+    """One line per backend, without a credential in any of them. 0 = all reachable.
+
+    Speaches is reported but does not fail the check: it serves one converter,
+    and an install that refused to start because the speech server was down
+    would stop every document's conversion for the sake of audio. Audio sent
+    meanwhile fails its attempts and is dead-lettered, which `queues` shows.
+    """
     failed = 0
-    for name, probe in (("MariaDB", _mariadb_check), ("Redis", _redis_check),
-                        ("Garage", _s3_check), ("Qdrant", _qdrant_check)):
+    for name, probe, required in (("MariaDB", _mariadb_check, True), ("Redis", _redis_check, True),
+                                  ("Garage", _s3_check, True), ("Qdrant", _qdrant_check, True),
+                                  ("Speaches", _speaches_check, False)):
         try:
             print(f"ok    {name}: {probe()}")
         except (Exception, SystemExit) as exc:  # noqa: BLE001 - report each, then the verdict
-            failed += 1
-            print(f"FAIL  {name}: {type(exc).__name__}: {exc}")
+            failed += required
+            print(f"{'FAIL' if required else 'WARN'}  {name}: {type(exc).__name__}: {exc}")
     return 1 if failed else 0
 
 

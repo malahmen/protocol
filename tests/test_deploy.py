@@ -38,9 +38,15 @@ class WorkersTest(unittest.TestCase):
         self.assertEqual(deploy.WORKERS["marker-light"][1], (routing.MARKER_LIGHT_QUEUE,))
         self.assertEqual(deploy.WORKERS["marker-heavy"][1], (routing.MARKER_HEAVY_QUEUE,))
 
-    def test_transcription_has_none_yet(self):
-        # Kamino item 68: Speaches on corelia is not measured or wired yet.
-        self.assertNotIn(routing.QUEUES["transcription"], self.queues_worked())
+    def test_transcription_has_a_worker(self):
+        # It had none, and audio waited in its queue for good (Kamino item 89).
+        self.assertEqual(deploy.WORKERS["transcription"],
+                         ("transcription", (routing.QUEUES["transcription"],)))
+
+    def test_every_converter_s_queue_has_a_worker(self):
+        for name in routing.CONVERTERS:
+            if name != "marker":          # marker's work waits in its two lanes, not its family name
+                self.assertIn(routing.queue_for(name), self.queues_worked(), name)
 
     def test_maintenance_runs_no_converter(self):
         self.assertIsNone(deploy.WORKERS["maintenance"][0])

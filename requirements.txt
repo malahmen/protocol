@@ -10,6 +10,7 @@ python-multipart==0.0.32
 # version marker's image carries; a 3.7 MB wheel, no torch. Optional to the
 # core: without it every PDF is an unknown cost, so the heavy lane.
 pypdfium2==5.10.1
+mutagen==1.48.1
 # The queue and the completion stream on meksha's Redis (redis_backends.py).
 # The same pins as protocol-droid's workers.
 rq==2.12.0

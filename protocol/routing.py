@@ -144,6 +144,11 @@ def validate_options(converter: str, options, settings) -> dict:
                 out["page_range"], settings.page_range_max_pages, settings.page_range_max_index)
 
     if converter == "transcription":
+        # Refused rather than queued where nothing transcribes: audio sent to a
+        # deployment without Speaches used to wait in convert.transcription
+        # for good, at "processing" (Kamino item 89).
+        if not settings.transcription_configured:
+            raise InvalidRequest("audio: transcription is not configured for this deployment (SPEACHES_URL)")
         # The model is a name the speech server looks up, not an import path,
         # so a free string is safe - within a strict alphabet.
         if "model" in out and not (isinstance(out["model"], str) and _MODEL_RE.match(out["model"])):
