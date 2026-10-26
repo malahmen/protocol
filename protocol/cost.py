@@ -40,6 +40,11 @@ _SAMPLE_PAGES = 3
 
 TRANSCRIPTION_SECONDS_PER_AUDIO_SECOND = 0.094
 
+# The converters whose estimate reads the source: whoever plans a job again
+# without it (a reconversion, a recovery) must read it for these, or the job
+# falls back to the unknown allowance (Kamino item 203).
+READS_SOURCE = frozenset({"marker", "transcription"})
+
 
 @dataclass(frozen=True)
 class Estimate:

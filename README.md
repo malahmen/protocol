@@ -175,7 +175,7 @@ A history prune deletes `superseded` outputs (and `alternative` ones, unless kep
 
 ### The completion stream
 
-Each finished job appends one event (Redis Stream `conversions.events`, once the adapter exists):
+Each finished job appends one event to the Redis Stream `conversions.events`:
 
 ```json
 {"event": "conversion", "document_id": "...", "conversion_id": "...", "state": "validation_pending",
@@ -218,7 +218,7 @@ Removal runs **index, then outputs, then source**, so a removal that stops halfw
 | `PROTOCOL_JOB_TIMEOUT_PER_PAGE` | `180` | per page: ~3x OCR's measured 54.7 s/page |
 | `PROTOCOL_JOB_TIMEOUT_UNKNOWN` | `21600` | a job whose page count cannot be known (6 h) |
 | `PROTOCOL_JOB_TIMEOUT_PER_AUDIO_MINUTE` | `18` | per minute of audio: ~3x Whisper's measured 0.094 s/s |
-| `SPEACHES_URL` | unset | set: audio is accepted and transcribed by Speaches there (`http://192.168.3.46:8000` on corelia). Needed by the API (to accept audio) and the transcription worker |
+| `SPEACHES_URL` | unset | set: audio is accepted and transcribed by Speaches there (`http://host.containers.internal:8000` on corelia: the LAN address is refused from a rootless container). Needed by the API (to accept audio) and the transcription worker |
 | `SPEACHES_MODEL` | `deepdml/faster-whisper-large-v3-turbo-ct2` | the model used when a request names none |
 | `SPEACHES_API_KEY` | unset | sent as a bearer token, if Speaches was started with one |
 
@@ -252,8 +252,8 @@ protocol/
   service.py    the contract: the requests the API makes, the jobs workers run
   worker.py     one job -> one handler
   api.py        the HTTP endpoints
-  cost.py       a marker job's estimated cost: its lane and its timeout
-  converters.py marker and markitdown, through protocol-droid's images
+  cost.py       a job's estimated cost - a PDF's pages, a recording's length: its lane and its timeout
+  converters.py marker and markitdown, through protocol-droid's images; transcription, through Speaches
   memory.py     in-memory backends, for the tests and the dev server
   redis_backends.py  the queue and the completion stream on Redis; the guarded worker
   s3_store.py   the source and output stores on Garage (S3)
@@ -283,9 +283,10 @@ Rules the code keeps, each from the specification:
 
 Each of these is a decision in the specification, not a gap in the code:
 
-- **"Succeeded" means converted, for now.** The specification says a *failed or rejected* reconversion touches nothing. Modes act when the conversion succeeds; if review must approve it first, the same step (`_apply_mode`) moves to the acceptance.
-- **The registry schema** (To decide 8), **the removal states** (9) and **the ingestion format** (2) - the code follows the sketch and names it where it deviates (`contract.py`).
+- **"Succeeded" means converted, for now.** The specification says a *failed or rejected* reconversion touches nothing. Modes act when the conversion succeeds; if review must approve it first, the same step (`_finish`) moves to the acceptance.
 - **Not built:** pre-signed uploads straight into the source store, webhooks (allowlisted targets only, when they come), and the retention rule for history.
+
+Decided since (2026-10-16), and built as decided: the registry schema is `contract.py`'s two records (To decide 8), the removal states are `removal_pending` -> `removed` (9), and the ingestion format is Markdown (2).
 
 ---
 
@@ -294,7 +295,7 @@ Each of these is a decision in the specification, not a gap in the code:
 - **[protocol-droid](https://github.com/malahmen/protocol-droid)** - the marker and markitdown engine. Its worker image becomes this service's marker worker; its provenance and option rules are the models for the ones here.
 - **[holo-convert](https://github.com/malahmen/holo-convert)** - the other direction: Markdown to PDF and DOCX.
 - **[Speaches](https://speaches.ai/)** - the speech server on corelia that the transcription converter calls.
-- **[scomp-link](https://github.com/malahmen/scomp-link)** - where the scripts that install and manage this on corelia will live.
+- **[scomp-link](https://github.com/malahmen/scomp-link)** - where the script that installs and manages this on corelia lives (`protocol.sh`).
 
 ## License
 

@@ -474,6 +474,39 @@ class QdrantIndex(unittest.TestCase):
             index._post(f"/collections/{COLLECTIONS[0]}/points/count", {"filter": {"must": "not a list"}})
 
 
+@unittest.skipUnless(HAVE_S3, "boto3 not installed")
+class S3Refusals(unittest.TestCase):
+    """What Garage answers that the happy path never shows (Kamino item 203)."""
+
+    def test_objects_s3_could_not_delete_are_an_error_not_a_count(self):
+        client = unittest.mock.Mock()
+        client.get_paginator.return_value.paginate.return_value = [
+            {"Contents": [{"Key": "d1/c1/a.md"}, {"Key": "d1/c1/b.md"}]}]
+        client.delete_objects.return_value = {"Errors": [
+            {"Key": "d1/c1/b.md", "Code": "AccessDenied", "Message": "no"}]}
+        store = s3_store.S3Store(client)
+        with self.assertRaisesRegex(RuntimeError, "could not delete 1 of 2 .*AccessDenied"):
+            store.delete_prefix("outputs/d1/c1/")
+        client.delete_objects.assert_called_once_with(
+            Bucket="outputs", Delete={"Objects": [{"Key": "d1/c1/a.md"}, {"Key": "d1/c1/b.md"}],
+                                      "Quiet": True})
+
+
+class QdrantRequests(unittest.TestCase):
+    def test_a_delete_waits_until_qdrant_has_applied_it(self):
+        # Without wait=true Qdrant answers before the points are gone, and a
+        # removal would go on to the outputs ahead of it (Kamino item 203).
+        index = qdrant_index.QdrantIndex("http://qdrant", ["a"])
+        sent = []
+
+        def post(path, body):
+            sent.append(path)
+            return {"count": 2} if path.endswith("/count") else {"status": "completed"}
+        with unittest.mock.patch.object(index, "_post", post):
+            self.assertEqual(index.delete_conversion("c1"), 2)
+        self.assertEqual(sent, ["/collections/a/points/count", "/collections/a/points/delete?wait=true"])
+
+
 class QdrantSettings(unittest.TestCase):
     def test_collections_must_be_named(self):
         with self.assertRaises(ValueError):

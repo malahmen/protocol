@@ -4,6 +4,7 @@ import socket
 import threading
 import time
 import unittest
+import unittest.mock
 import urllib.request
 
 import helpers
@@ -88,6 +89,21 @@ class ApiTest(unittest.TestCase):
     def test_size_cap_is_413(self):
         self.setUp(Settings(max_upload_bytes=4))
         self.assertEqual(self.upload(data=b"12345").status_code, 413)
+
+    def test_the_size_cap_is_enforced_while_reading(self):
+        # The API stops one chunk past the cap and never hands the service
+        # an oversized source (Kamino item 203: the service's own check hid
+        # a missing one here). A source of exactly the cap is accepted.
+        from protocol import api
+        self.setUp(Settings(max_upload_bytes=8))
+        calls = []
+        real = self.service.submit
+        self.service.submit = lambda data, *a, **kw: (calls.append(len(data)), real(data, *a, **kw))[1]
+        with unittest.mock.patch.object(api, "_CHUNK", 4):
+            self.assertEqual(self.upload(data=b"x" * 1000).status_code, 413)
+            self.assertEqual(calls, [])
+            self.assertEqual(self.upload(data=b"y" * 8).status_code, 202)
+        self.assertEqual(calls, [8])
 
     def test_full_queue_is_429(self):
         self.setUp(Settings(queue_max_depth=1))

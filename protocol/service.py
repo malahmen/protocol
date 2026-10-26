@@ -186,8 +186,8 @@ class ConversionService:
             raise InvalidRequest("mode must be one of " + ", ".join(c.MODES))
         chosen = routing.choose(doc.original_name, converter)
         opts = routing.validate_options(chosen, options, self.settings)
-        # Only marker's cost depends on the source, so only marker reads it here.
-        data = self.store.get(doc.source_key) if chosen == "marker" else None
+        # Only some converters' cost depends on the source; only they read it here.
+        data = self.store.get(doc.source_key) if chosen in cost.READS_SOURCE else None
         queue, timeout = self._plan(chosen, doc.original_name, data, opts)
         self._admit(queue)
         conv = c.Conversion(conversion_id=new_id(), document_id=doc.document_id, mode=mode,
@@ -348,8 +348,8 @@ class ConversionService:
         if doc is None or not doc.live:
             self._fail(conv, found, "document removed before conversion")
             return
-        # Only marker's lane depends on the source (_plan), so only marker reads it.
-        data = self.store.get(doc.source_key) if conv.converter == "marker" else None
+        # Only some converters' plan depends on the source (_plan); only they read it.
+        data = self.store.get(doc.source_key) if conv.converter in cost.READS_SOURCE else None
         if conv.state != c.CONVERTING:
             queue, timeout = self._plan(conv.converter, doc.original_name, data, conv.options)
             self.queue.enqueue(queue, {"kind": "convert", "conversion_id": conv.conversion_id},
