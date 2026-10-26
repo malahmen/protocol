@@ -100,9 +100,14 @@ def create_app(service: ConversionService) -> FastAPI:
     def healthz():
         return {"ok": True}
 
+    # A plain def, not async (Kamino item 189): service.submit hashes, reads
+    # the PDF, stores the source on Garage and writes MariaDB, all blocking.
+    # On the event loop that stalled every other request for as long as a
+    # large upload took to store - /healthz included, which scomp-link reads
+    # with a 3 s timeout. FastAPI runs a plain def on its thread pool.
     @app.post("/documents")
-    async def submit(file: UploadFile = File(...), converter: str = Form(routing.AUTO),
-                     options: str = Form("{}"), submitted_by: Optional[str] = Form(None)):
+    def submit(file: UploadFile = File(...), converter: str = Form(routing.AUTO),
+               options: str = Form("{}"), submitted_by: Optional[str] = Form(None)):
         try:
             parsed = json.loads(options or "{}")
         except json.JSONDecodeError:
@@ -111,7 +116,7 @@ def create_app(service: ConversionService) -> FastAPI:
         # refused without holding all of it in memory.
         cap = service.settings.max_upload_bytes
         buf = bytearray()
-        while chunk := await file.read(_CHUNK):
+        while chunk := file.file.read(_CHUNK):
             buf.extend(chunk)
             if len(buf) > cap:
                 raise TooLarge(f"source is over {cap} bytes")

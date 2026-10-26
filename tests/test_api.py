@@ -1,6 +1,10 @@
 """HTTP tests. They need fastapi and httpx (requirements-dev.txt); skipped without them."""
 import json
+import socket
+import threading
+import time
 import unittest
+import urllib.request
 
 import helpers
 from protocol.config import Settings
@@ -8,6 +12,8 @@ from protocol.worker import drain
 
 try:
     from fastapi.testclient import TestClient
+
+    import uvicorn
 
     from protocol.api import create_app
     HAVE_FASTAPI = True
@@ -92,6 +98,55 @@ class ApiTest(unittest.TestCase):
 
     def test_healthz(self):
         self.assertEqual(self.client.get("/healthz").json(), {"ok": True})
+
+
+@unittest.skipUnless(HAVE_FASTAPI, "fastapi/httpx/uvicorn not installed")
+class NonBlockingTest(unittest.TestCase):
+    """Kamino item 189: POST /documents ran the blocking submit (hash, PDF
+    facts, the S3 put, MariaDB) on the event loop, so a slow store stalled
+    every request - /healthz answered in 3.05 s behind a 3 s put."""
+
+    def test_healthz_answers_while_an_upload_is_being_stored(self):
+        service, parts, _ = helpers.build()
+        store, real = parts["store"], parts["store"].put
+        storing, release = threading.Event(), threading.Event()
+
+        def slow_put(key, data):
+            storing.set()
+            release.wait(10)           # a large upload on its way to taris
+            real(key, data)
+        store.put = slow_put
+        self.addCleanup(release.set)
+
+        sock = socket.socket()
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+        server = uvicorn.Server(uvicorn.Config(create_app(service), log_level="error"))
+        thread = threading.Thread(target=server.run, kwargs={"sockets": [sock]}, daemon=True)
+        thread.start()
+        self.addCleanup(thread.join, 10)
+        self.addCleanup(setattr, server, "should_exit", True)
+        deadline = time.monotonic() + 10
+        while not server.started and time.monotonic() < deadline:
+            time.sleep(0.02)
+        base = f"http://127.0.0.1:{port}"
+
+        body = (b'--x\r\nContent-Disposition: form-data; name="file"; filename="a.docx"\r\n\r\n'
+                b"hello\r\n--x--\r\n")
+        upload = urllib.request.Request(base + "/documents", data=body,
+                                        headers={"Content-Type": "multipart/form-data; boundary=x"})
+        answers = []
+        uploader = threading.Thread(target=lambda: answers.append(urllib.request.urlopen(upload, timeout=15).status))
+        uploader.start()
+        self.assertTrue(storing.wait(10), "the upload never reached the store")
+        started = time.monotonic()
+        with urllib.request.urlopen(base + "/healthz", timeout=5) as reply:
+            self.assertEqual(json.load(reply), {"ok": True})
+        self.assertLess(time.monotonic() - started, 2, "/healthz waited for the upload")
+        self.assertTrue(uploader.is_alive(), "the upload finished first: nothing was proven")
+        release.set()
+        uploader.join(15)
+        self.assertEqual(answers, [202])
 
 
 if __name__ == "__main__":
