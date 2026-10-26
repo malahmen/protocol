@@ -93,6 +93,7 @@ SCHEMA = (
         finished_at    DATETIME(6)     NULL,
         error          TEXT            NULL,
         deleted_at     DATETIME(6)     NULL,
+        previous_conversion_id VARCHAR(64) NULL,
         PRIMARY KEY (conversion_id),
         UNIQUE KEY seq (seq),
         KEY document_created (document_id, created_at, seq),
@@ -100,13 +101,16 @@ SCHEMA = (
             REFERENCES documents (document_id)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin
     """,
+    # Added after the first install (Kamino item 166): a table made before it
+    # gains the column when the API next starts, which applies SCHEMA.
+    "ALTER TABLE conversions ADD COLUMN IF NOT EXISTS previous_conversion_id VARCHAR(64) NULL",
 )
 
 _DOC_FIELDS = ("document_id", "content_hash", "original_name", "media_type", "size", "source_key",
                "submitted_at", "submitted_by", "state", "current_conversion_id", "removed_at")
 _CONV_FIELDS = ("conversion_id", "document_id", "mode", "converter", "options", "state", "role",
                 "output_key", "tool_versions", "attempts", "created_at", "started_at",
-                "finished_at", "error", "deleted_at")
+                "finished_at", "error", "deleted_at", "previous_conversion_id")
 _JSON_FIELDS = ("options", "tool_versions")
 
 

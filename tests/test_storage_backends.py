@@ -320,6 +320,15 @@ class MariaDBOnly(unittest.TestCase):
         mariadb_registry.create_schema(conn)
         mariadb_registry.create_schema(conn)
 
+    def test_a_table_from_before_previous_conversion_id_gains_it(self):
+        # Item 166 added the column; meksha's table predates it.
+        with db_connect().cursor() as cur:
+            cur.execute("ALTER TABLE conversions DROP COLUMN previous_conversion_id")
+        mariadb_registry.create_schema(db_connect())
+        self.registry.add_document_if_absent(doc("d1"))
+        self.registry.add_conversion(conv("c1", previous_conversion_id="c0"))
+        self.assertEqual(self.registry.get_conversion("c1").previous_conversion_id, "c0")
+
     def test_a_conversion_needs_its_document(self):
         import pymysql
         with self.assertRaises(pymysql.err.IntegrityError):
@@ -455,7 +464,7 @@ def _on_real_backends(case):
 # bug exists only there.
 for _case in (test_service.SubmitTest, test_service.ConversionTest, test_service.ModesTest,
               test_service.RemovalTest, test_service.PruneTest, test_service.RecoveryTest,
-              test_service.IdTest):
+              test_service.IdTest, test_service.FinishTest):
     globals()[_case.__name__ + "OnRealBackends"] = _on_real_backends(_case)
 del _case
 

@@ -334,6 +334,128 @@ class ModesTest(Base):
             self.service.reconvert("nope")
 
 
+class Blip(ConnectionError):
+    """A backend unreachable for a moment."""
+
+
+class FinishTest(Base):
+    """Kamino item 166: finishing a conversion - the mode, the document's
+    pointer, a replaced output, the event - is run again by the job's retry,
+    and a document never points at a deleted output."""
+
+    def setUp(self):
+        super().setUp()
+        self.doc, (self.first,) = self.submit_and_convert()
+        self.doc_id = self.doc.document_id
+        self.registry = self.parts["registry"]
+
+    def queued_reconversion(self, mode):
+        conv = self.service.reconvert(self.doc_id, mode)
+        return conv, self.queue.pop_any()
+
+    def fail_once(self, obj, method, when=lambda *a: True, exc=Blip):
+        real, state = getattr(obj, method), {"done": False}
+
+        def flaky(*args):
+            if not state["done"] and when(*args):
+                state["done"] = True
+                raise exc(f"{method} blip")
+            return real(*args)
+        setattr(obj, method, flaky)
+        self.addCleanup(setattr, obj, method, real)
+        return state
+
+    def assert_points_at_its_output(self):
+        doc = self.registry.get_document(self.doc_id)
+        keys = self.store.list(c.output_prefix(self.doc_id, doc.current_conversion_id))
+        self.assertTrue(any(k.endswith("out.md") for k in keys),
+                        f"the document points at {doc.current_conversion_id}, which has no output")
+        return doc
+
+    def test_a_registry_blip_while_pointing_the_document_is_repaired_by_the_retry(self):
+        for mode, old_role in ((c.REPLACE, c.REPLACED), (c.UPDATE, c.SUPERSEDED)):
+            with self.subTest(mode=mode):
+                old = self.registry.get_document(self.doc_id).current_conversion_id
+                conv, job = self.queued_reconversion(mode)
+                self.fail_once(self.registry, "save_document",
+                               lambda d: d.current_conversion_id == conv.conversion_id)
+                with self.assertRaises(Blip):
+                    handle(self.service, job)
+                self.assert_points_at_its_output()           # the old one, still whole
+                handle(self.service, job)                    # the infra retry
+                doc = self.assert_points_at_its_output()
+                self.assertEqual(doc.current_conversion_id, conv.conversion_id)
+                roles = {cv.conversion_id: cv.role for cv in self.registry.conversions_of(self.doc_id)}
+                self.assertEqual((roles[conv.conversion_id], roles[old]), (c.CURRENT, old_role))
+                self.assertEqual(bool(self.store.list(c.output_prefix(self.doc_id, old))),
+                                 mode != c.REPLACE)
+                (event,) = [e for e in self.events if e.get("conversion_id") == conv.conversion_id]
+                self.assertEqual(event["previous_conversion_id"], old)
+
+    def test_any_single_failure_while_finishing_a_replace_is_repaired(self):
+        """Fail each backend call of the job in turn, once; retry the job as
+        the worker would. Whichever call failed, the document never points at
+        a deleted output, and ends on the new conversion with it announced."""
+        calls = [("registry", m) for m in ("get_document", "get_conversion", "save_document",
+                                            "save_conversion")]
+        calls += [("store", m) for m in ("delete_prefix", "put")]
+        calls += [("events", "append")]
+        for which, method in calls:
+            for nth in range(1, 6):
+                with self.subTest(call=f"{which}.{method}", nth=nth):
+                    self.setUp()
+                    conv, job = self.queued_reconversion(c.REPLACE)
+                    seen = {"n": 0}
+
+                    def when(*_args):
+                        seen["n"] += 1
+                        return seen["n"] == nth
+                    state = self.fail_once(self.parts[which], method, when)
+                    try:
+                        handle(self.service, job)
+                    except Blip:
+                        self.assert_points_at_its_output()
+                        handle(self.service, job)
+                    drain(self.service, self.queue)          # a failed attempt's retry
+                    if not state["done"]:
+                        break                                 # fewer calls than nth
+                    doc = self.assert_points_at_its_output()
+                    self.assertEqual(doc.current_conversion_id, conv.conversion_id)
+                    self.assertEqual(self.store.list(c.output_prefix(self.doc_id, self.first.conversion_id)), [])
+                    self.assertTrue(any(e.get("conversion_id") == conv.conversion_id for e in self.events))
+
+    def test_a_worker_killed_while_finishing_is_finished_by_its_recovery(self):
+        conv, job = self.queued_reconversion(c.REPLACE)
+        self.fail_once(self.registry, "save_document",
+                       lambda d: d.current_conversion_id == conv.conversion_id, exc=Died)
+        with self.assertRaises(Died):
+            handle(self.service, job)
+        recover(self.service, job)
+        doc = self.assert_points_at_its_output()
+        self.assertEqual(doc.current_conversion_id, conv.conversion_id)
+        self.assertTrue(any(e.get("conversion_id") == conv.conversion_id for e in self.events))
+
+    def test_a_completion_event_lost_to_a_stream_blip_is_sent_on_the_retry(self):
+        conv, job = self.queued_reconversion(c.UPDATE)
+        self.fail_once(self.parts["events"], "append")
+        with self.assertRaises(Blip):
+            handle(self.service, job)
+        handle(self.service, job)
+        (event,) = [e for e in self.events if e.get("conversion_id") == conv.conversion_id]
+        self.assertEqual((event["role"], event["previous_conversion_id"]),
+                         (c.CURRENT, self.first.conversion_id))
+
+    def test_a_redelivery_after_a_later_conversion_took_over_changes_nothing(self):
+        second = self.reconvert(self.doc_id, c.UPDATE)
+        third = self.reconvert(self.doc_id, c.REPLACE)
+        before = len(self.events)
+        handle(self.service, {"kind": "convert", "conversion_id": second.conversion_id})
+        handle(self.service, {"kind": "convert", "conversion_id": self.first.conversion_id})
+        doc = self.assert_points_at_its_output()
+        self.assertEqual(doc.current_conversion_id, third.conversion_id)
+        self.assertEqual(len(self.events), before)
+
+
 class RemovalTest(Base):
     def test_removal_cascades_in_order_and_leaves_a_tombstone(self):
         doc, _ = self.submit_and_convert()

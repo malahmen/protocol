@@ -223,8 +223,13 @@ class ConversionService:
 
     def run_conversion(self, conversion_id: str) -> None:
         conv = self.registry.get_conversion(conversion_id)
-        if conv is None or conv.state in (c.VALIDATION_PENDING, c.CONVERSION_FAILED):
-            return  # unknown, or already finished by an earlier delivery
+        if conv is None or conv.state == c.CONVERSION_FAILED:
+            return  # unknown, or already failed by an earlier delivery
+        if conv.state == c.VALIDATION_PENDING:
+            # Converted by an earlier delivery, which may have stopped before
+            # the document pointed at it or before the event: finish it.
+            self._finish(conv.conversion_id)
+            return
         doc = self.registry.get_document(conv.document_id)
         if doc is None or not doc.live:
             self._fail(conv, doc, "document removed before conversion")
@@ -272,13 +277,21 @@ class ConversionService:
             self._fail(conv, doc, "document removed while converting")
             return
 
+        # Decision 13: the mode acts now that the conversion has succeeded.
+        # The role it will have and the conversion it takes over from are
+        # recorded with its new state, in one write, so _finish can be run
+        # again from the registry alone.
         conv.state = c.VALIDATION_PENDING
         conv.output_key = prefix
-        previous = self._apply_mode(doc, conv)
-        self.events.append({"event": c.EVENT_CONVERSION, "document_id": doc.document_id,
-                            "conversion_id": conv.conversion_id, "state": conv.state,
-                            "output_key": conv.output_key, "mode": conv.mode, "role": conv.role,
-                            "previous_conversion_id": previous})
+        current = doc.current_conversion_id
+        if current == conv.conversion_id:
+            current = None             # already applied: never its own previous (item 188)
+        if conv.mode == c.ADD and current is not None:
+            conv.role, conv.previous_conversion_id = c.ALTERNATIVE, None
+        else:
+            conv.role, conv.previous_conversion_id = c.CURRENT, current
+        self.registry.save_conversion(conv)
+        self._finish(conv.conversion_id)
 
     def recover_conversion(self, conversion_id: str) -> None:
         """A conversion whose worker died while it held the job (Kamino item 87).
@@ -292,8 +305,11 @@ class ConversionService:
         One the worker had taken but not yet started is queued again as it was.
         """
         conv = self.registry.get_conversion(conversion_id)
-        if conv is None or conv.state in (c.VALIDATION_PENDING, c.CONVERSION_FAILED):
-            return  # unknown, or finished before the worker died
+        if conv is None or conv.state == c.CONVERSION_FAILED:
+            return  # unknown, or failed before the worker died
+        if conv.state == c.VALIDATION_PENDING:
+            self._finish(conv.conversion_id)   # converted; the worker may have died finishing it
+            return
         doc = self.registry.get_document(conv.document_id)
         if doc is None or not doc.live:
             self._fail(conv, doc, "document removed before conversion")
@@ -323,33 +339,59 @@ class ConversionService:
         else:
             self._fail(conv, doc, reason)
 
-    def _apply_mode(self, doc: c.Document, conv: c.Conversion) -> Optional[str]:
-        """Decision 13, applied once the new conversion has succeeded.
+    def _finish(self, conversion_id: str) -> None:
+        """Make a converted conversion's mode take effect, then announce it.
 
-        Returns the conversion that stopped being current, if any, so the
-        ingestion side can ingest the new points and then remove the old ones -
-        "ingest new, then remove old", so a search never sees a gap.
+        Idempotent, and run again by every redelivery of a converted job
+        (Kamino item 166): a step that failed - the registry or the store
+        unreachable for a moment - is retried by the job's retry, and this
+        picks up from what the registry shows. So the order matters:
+
+        1. the previous current conversion is marked `superseded` or
+           `replaced` (its output still there);
+        2. the document points at the new one;
+        3. only then is a replaced output deleted;
+        4. the event goes out - again on a redelivery: the stream is
+           at-least-once, and its consumers dedupe on `conversion_id`.
+
+        A document never points at a deleted output, whichever step fails.
+        The event carries the conversion that stopped being current, so the
+        ingestion side can ingest the new points and then remove the old
+        ones - "ingest new, then remove old", so a search never sees a gap.
         """
-        previous = self.registry.get_conversion(doc.current_conversion_id) if doc.current_conversion_id else None
-        if conv.mode == c.ADD and previous is not None:
-            conv.role = c.ALTERNATIVE
-            self.registry.save_conversion(conv)
-            return None
-        if previous is not None:
-            if conv.mode == c.REPLACE:
+        conv = self.registry.get_conversion(conversion_id)
+        doc = self.registry.get_document(conv.document_id)
+        if doc is None or not doc.live:
+            return            # being removed: the removal deletes the outputs and says so
+        if conv.role == c.CURRENT and doc.current_conversion_id != conv.conversion_id:
+            if doc.current_conversion_id != conv.previous_conversion_id:
+                # Another conversion became current after this one converted:
+                # this one, finishing later, takes over from that one.
+                conv.previous_conversion_id = doc.current_conversion_id
+                self.registry.save_conversion(conv)
+            previous = (self.registry.get_conversion(conv.previous_conversion_id)
+                        if conv.previous_conversion_id else None)
+            if previous is not None and previous.role == c.CURRENT:
+                previous.role = c.REPLACED if conv.mode == c.REPLACE else c.SUPERSEDED
+                self.registry.save_conversion(previous)
+            doc.current_conversion_id = conv.conversion_id
+            doc.state = conv.state
+            self.registry.save_document(doc)
+        elif conv.role not in (c.CURRENT, c.ALTERNATIVE) or conv.deleted_at is not None:
+            return            # superseded, replaced or pruned since: a later event said so
+        previous_id = conv.previous_conversion_id if conv.role == c.CURRENT else None
+        if conv.mode == c.REPLACE and previous_id:
+            previous = self.registry.get_conversion(previous_id)
+            if previous is not None and previous.deleted_at is None:
                 # Only the current output goes; earlier history is untouched.
-                self.store.delete_prefix(c.output_prefix(doc.document_id, previous.conversion_id))
+                self.store.delete_prefix(c.output_prefix(doc.document_id, previous_id))
                 previous.role = c.REPLACED
                 previous.deleted_at = c.now()
-            else:
-                previous.role = c.SUPERSEDED
-            self.registry.save_conversion(previous)
-        conv.role = c.CURRENT
-        self.registry.save_conversion(conv)
-        doc.current_conversion_id = conv.conversion_id
-        doc.state = conv.state
-        self.registry.save_document(doc)
-        return previous.conversion_id if previous else None
+                self.registry.save_conversion(previous)
+        self.events.append({"event": c.EVENT_CONVERSION, "document_id": doc.document_id,
+                            "conversion_id": conv.conversion_id, "state": conv.state,
+                            "output_key": conv.output_key, "mode": conv.mode, "role": conv.role,
+                            "previous_conversion_id": previous_id})
 
     def _fail(self, conv: c.Conversion, doc: Optional[c.Document], reason: str) -> None:
         conv.state = c.CONVERSION_FAILED
