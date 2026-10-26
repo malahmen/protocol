@@ -197,6 +197,37 @@ class ThroughTheService(unittest.TestCase):
         self.assertEqual(self.parts["store"].get(md[0]), b"the archive is converted\n")
 
 
+class Replanned(unittest.TestCase):
+    """Kamino item 203: a reconversion or a recovery plans the job again,
+    and read the source for marker only - a recording got the 6 h unknown
+    allowance (60 s of audio: 21600 s instead of 1818)."""
+
+    def setUp(self):
+        self.settings = Settings(transcription_configured=True)
+        self.service, self.parts, _ = helpers.build(self.settings)
+        self.queue = self.parts["queue"]
+        self.expected = cost.timeout(cost.estimate("transcription", "talk.wav", wav(60), {}),
+                                     self.settings.job_timeout_base, self.settings.job_timeout_per_page,
+                                     self.settings.job_timeout_unknown,
+                                     self.settings.job_timeout_per_audio_minute)
+        self.assertLess(self.expected, self.settings.job_timeout_unknown)
+
+    def last_timeout(self):
+        return self.queue.jobs["convert.transcription"][-1][2]
+
+    def test_a_reconverted_recording_keeps_its_length_based_timeout(self):
+        doc, _, _ = self.service.submit(wav(60), "talk.wav")
+        drain(self.service, self.queue)
+        self.service.reconvert(doc.document_id)
+        self.assertEqual(self.last_timeout(), self.expected)
+
+    def test_a_recovered_recording_keeps_its_length_based_timeout(self):
+        doc, conv, _ = self.service.submit(wav(60), "talk.wav")
+        self.queue.pop_any()
+        self.service.recover_conversion(conv.conversion_id)      # taken, not started
+        self.assertEqual(self.last_timeout(), self.expected)
+
+
 class Wiring(unittest.TestCase):
     # The worker itself is in test_deploy.py, which needs the backends' clients.
     def test_the_transcription_worker_runs_speaches_converter(self):

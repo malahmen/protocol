@@ -211,6 +211,53 @@ class RegistryBehaviour:
         self.assertEqual(len({d.document_id for d, _ in results}), 1)
 
 
+    # Kamino item 188: the conditional saves.
+
+    def test_a_live_save_never_brings_back_a_removed_document(self):
+        for state in (c.REMOVAL_PENDING, c.REMOVED):
+            with self.subTest(state=state):
+                d, _ = self.registry.add_document_if_absent(doc("d-" + state, state[0] * 64))
+                d.state = state
+                self.registry.save_document(d)
+                stale = doc("d-" + state, state[0] * 64, state=c.VALIDATION_PENDING,
+                            current_conversion_id="c1")
+                self.assertFalse(self.registry.save_live_document(stale, None))
+                self.assertEqual(self.registry.get_document("d-" + state).state, state)
+
+    def test_a_live_save_needs_the_pointer_it_expects(self):
+        self.registry.add_document_if_absent(doc("d1", current_conversion_id="c1"))
+        moved = doc("d1", state=c.VALIDATION_PENDING, current_conversion_id="c2")
+        self.assertFalse(self.registry.save_live_document(moved, None))
+        self.assertEqual(self.registry.get_document("d1").current_conversion_id, "c1")
+        self.assertTrue(self.registry.save_live_document(moved, "c1"))
+        self.assertEqual(self.registry.get_document("d1"), moved)
+        self.assertTrue(self.registry.save_live_document(moved, "c2"))      # changing nothing is a yes
+
+    def test_a_conditional_conversion_save_needs_the_state_and_attempts_it_expects(self):
+        self.registry.add_document_if_absent(doc("d1"))
+        self.registry.add_conversion(conv("c1", state=c.CONVERTING, attempts=1))
+        mine = conv("c1", state=c.VALIDATION_PENDING, attempts=1, role=c.CURRENT)
+        self.assertFalse(self.registry.update_conversion_if(mine, c.CONVERTING, 2))
+        self.assertFalse(self.registry.update_conversion_if(mine, c.CONVERSION_PENDING, 1))
+        self.assertEqual(self.registry.get_conversion("c1").state, c.CONVERTING)
+        self.assertTrue(self.registry.update_conversion_if(mine, c.CONVERTING, 1))
+        self.assertEqual(self.registry.get_conversion("c1"), mine)
+        self.assertTrue(self.registry.update_conversion_if(mine, c.VALIDATION_PENDING, 1))
+        self.assertFalse(self.registry.update_conversion_if(conv("c9"), c.CONVERSION_PENDING, 0))
+
+    def test_a_stale_save_never_clears_deleted_at(self):
+        self.registry.add_document_if_absent(doc("d1"))
+        deleted = conv("c1", state=c.CONVERTING, attempts=1, deleted_at=T0)
+        self.registry.add_conversion(deleted)
+        stale = conv("c1", state=c.CONVERSION_PENDING, attempts=1)
+        self.registry.save_conversion(stale)
+        self.assertEqual(self.registry.get_conversion("c1").deleted_at, T0)
+        self.assertEqual(self.registry.get_conversion("c1").state, c.CONVERSION_PENDING)
+        stale.state = c.CONVERSION_FAILED
+        self.assertTrue(self.registry.update_conversion_if(stale, c.CONVERSION_PENDING, 1))
+        self.assertEqual(self.registry.get_conversion("c1").deleted_at, T0)
+
+
 class StoreBehaviour:
     """Every ObjectStore must do this. setUp provides self.store."""
 
@@ -320,6 +367,15 @@ class MariaDBOnly(unittest.TestCase):
         mariadb_registry.create_schema(conn)
         mariadb_registry.create_schema(conn)
 
+    def test_a_table_from_before_previous_conversion_id_gains_it(self):
+        # Item 166 added the column; meksha's table predates it.
+        with db_connect().cursor() as cur:
+            cur.execute("ALTER TABLE conversions DROP COLUMN previous_conversion_id")
+        mariadb_registry.create_schema(db_connect())
+        self.registry.add_document_if_absent(doc("d1"))
+        self.registry.add_conversion(conv("c1", previous_conversion_id="c0"))
+        self.assertEqual(self.registry.get_conversion("c1").previous_conversion_id, "c0")
+
     def test_a_conversion_needs_its_document(self):
         import pymysql
         with self.assertRaises(pymysql.err.IntegrityError):
@@ -418,6 +474,39 @@ class QdrantIndex(unittest.TestCase):
             index._post(f"/collections/{COLLECTIONS[0]}/points/count", {"filter": {"must": "not a list"}})
 
 
+@unittest.skipUnless(HAVE_S3, "boto3 not installed")
+class S3Refusals(unittest.TestCase):
+    """What Garage answers that the happy path never shows (Kamino item 203)."""
+
+    def test_objects_s3_could_not_delete_are_an_error_not_a_count(self):
+        client = unittest.mock.Mock()
+        client.get_paginator.return_value.paginate.return_value = [
+            {"Contents": [{"Key": "d1/c1/a.md"}, {"Key": "d1/c1/b.md"}]}]
+        client.delete_objects.return_value = {"Errors": [
+            {"Key": "d1/c1/b.md", "Code": "AccessDenied", "Message": "no"}]}
+        store = s3_store.S3Store(client)
+        with self.assertRaisesRegex(RuntimeError, "could not delete 1 of 2 .*AccessDenied"):
+            store.delete_prefix("outputs/d1/c1/")
+        client.delete_objects.assert_called_once_with(
+            Bucket="outputs", Delete={"Objects": [{"Key": "d1/c1/a.md"}, {"Key": "d1/c1/b.md"}],
+                                      "Quiet": True})
+
+
+class QdrantRequests(unittest.TestCase):
+    def test_a_delete_waits_until_qdrant_has_applied_it(self):
+        # Without wait=true Qdrant answers before the points are gone, and a
+        # removal would go on to the outputs ahead of it (Kamino item 203).
+        index = qdrant_index.QdrantIndex("http://qdrant", ["a"])
+        sent = []
+
+        def post(path, body):
+            sent.append(path)
+            return {"count": 2} if path.endswith("/count") else {"status": "completed"}
+        with unittest.mock.patch.object(index, "_post", post):
+            self.assertEqual(index.delete_conversion("c1"), 2)
+        self.assertEqual(sent, ["/collections/a/points/count", "/collections/a/points/delete?wait=true"])
+
+
 class QdrantSettings(unittest.TestCase):
     def test_collections_must_be_named(self):
         with self.assertRaises(ValueError):
@@ -455,7 +544,8 @@ def _on_real_backends(case):
 # bug exists only there.
 for _case in (test_service.SubmitTest, test_service.ConversionTest, test_service.ModesTest,
               test_service.RemovalTest, test_service.PruneTest, test_service.RecoveryTest,
-              test_service.IdTest):
+              test_service.IdTest, test_service.FinishTest,
+              test_service.AtLeastOnceTest):
     globals()[_case.__name__ + "OnRealBackends"] = _on_real_backends(_case)
 del _case
 

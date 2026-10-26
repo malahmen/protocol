@@ -8,7 +8,10 @@ rather than inventing a second vocabulary.
 The record fields ARE the registry schema (To decide 8, decided 2026-10-16:
 the MariaDB DDL follows these fields). One deliberate deviation: `marker_version` and `llm_service`
 became `tool_versions` and `options`, because the API serves more than one
-converter and each pins different packages.
+converter and each pins different packages. One addition:
+`previous_conversion_id`, the conversion a new current one took over from,
+recorded when it converts so that finishing it can be run again
+(Kamino item 166).
 """
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -94,6 +97,11 @@ class Conversion:
     finished_at: Optional[datetime] = None
     error: Optional[str] = None         # for operators; never echoed to callers
     deleted_at: Optional[datetime] = None
+    # The conversion this one took over from as current (update, replace);
+    # None for a first conversion and for an alternative. Recorded when it
+    # converts, before the document points at it: what a redelivery needs to
+    # finish the job - the pointer, a replaced output, the event (item 166).
+    previous_conversion_id: Optional[str] = None
 
 
 def source_key(document_id: str, name: str) -> str:

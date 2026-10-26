@@ -198,7 +198,8 @@ class ThroughTheService(RedisCase):
     def test_a_job_that_fails_outside_the_converter_every_time_is_dead_lettered(self):
         service, parts, _ = self.build(self._no_delay())
         doc, conv, _ = service.submit(b"PK", "notes.docx")
-        parts["registry"].save_conversion = mock.Mock(side_effect=ConnectionError("mariadb down"))
+        down = mock.Mock(side_effect=ConnectionError("mariadb down"))
+        parts["registry"].save_conversion = parts["registry"].update_conversion_if = down
         self.work(service, routing.worker_queues("markitdown"))
         (dead,) = self.queue.dead_letters("convert.markitdown")
         self.assertIn("gave up after 6 retries: ConnectionError: mariadb down", dead["reason"])
@@ -215,12 +216,18 @@ class ThroughTheService(RedisCase):
         self.assertEqual([call[1] for call in convs["marker"].calls], ["note.pdf", "book.pdf"])
 
     def test_a_timed_out_conversion_fails_at_once_and_is_not_retried(self):
-        slow = helpers.FakeConverter("markitdown", on_convert=lambda: time.sleep(5))
+        # "Stopped, not waited out" is read from the converter itself, not
+        # the wall clock: a < 4 s bound failed at 4.04 s on a loaded host
+        # (Kamino item 203). The sleep is long enough that a job waited out
+        # would be plain, and nothing after it may run.
+        woke = []
+        slow = helpers.FakeConverter("markitdown", on_convert=lambda: (time.sleep(30), woke.append(1)))
         service, parts, _ = self.build(Settings(job_timeout_unknown=1), markitdown=slow)
         doc, conv, _ = service.submit(b"PK", "slow.docx")
         started = time.monotonic()
         self.work(service, routing.worker_queues("markitdown"))
-        self.assertLess(time.monotonic() - started, 4)          # stopped, not waited out
+        self.assertEqual(woke, [], "the converter ran to the end of its sleep")
+        self.assertLess(time.monotonic() - started, 25)         # stopped, not waited out
         conv = parts["registry"].get_conversion(conv.conversion_id)
         self.assertEqual((conv.state, conv.attempts), ("conversion_failed", 1))
         self.assertIn("JobTimedOut", conv.error)
@@ -342,6 +349,45 @@ class Abandoned(RedisCase):
         self.assertEqual(self.conn.keys(rb.ALIVE_PREFIX + "*"), [])   # and gone after
 
 
+@unittest.skipUnless(HAVE_RQ, "rq and redis not installed")
+class Check(unittest.TestCase):
+    """check() on its own, no Redis: what a job must look like to run (Kamino
+    item 203 - these refusals survived mutation)."""
+
+    def job(self, **over):
+        fields = dict(func_name=rb.JOB_FUNC, args=({"kind": "convert", "conversion_id": "c"},),
+                      kwargs={}, _success_callback_name=None, _failure_callback_name=None,
+                      _stopped_callback_name=None, webhooks=None, _dependency_ids=[])
+        fields.update(over)
+        return mock.Mock(spec=list(fields), **fields)
+
+    def test_protocols_own_job_passes(self):
+        rb.check(self.job())
+
+    def test_anything_but_exactly_one_dict_is_refused(self):
+        one = {"kind": "convert", "conversion_id": "c"}
+        for args, kwargs in (((), {}), ((one, one), {}), ((one,), {"x": 1}), (("c",), {}), ((), {"job": one})):
+            with self.subTest(args=args, kwargs=kwargs), self.assertRaisesRegex(rb.JobRefused, "exactly one"):
+                rb.check(self.job(args=args, kwargs=kwargs))
+
+    def test_a_dependency_is_refused(self):
+        with self.assertRaisesRegex(rb.JobRefused, "depends"):
+            rb.check(self.job(_dependency_ids=["another-job"]))
+
+    def test_each_callback_and_a_webhook_are_refused(self):
+        for which in ("success", "failure", "stopped"):
+            with self.subTest(which=which), self.assertRaisesRegex(rb.JobRefused, which):
+                rb.check(self.job(**{f"_{which}_callback_name": "os.system"}))
+        with self.assertRaisesRegex(rb.JobRefused, "webhooks"):
+            rb.check(self.job(webhooks=["http://elsewhere/"]))
+
+    def test_a_job_that_cannot_be_read_is_refused(self):
+        unreadable = mock.Mock(spec=["func_name"])
+        type(unreadable).func_name = mock.PropertyMock(side_effect=ValueError("pickle"))
+        with self.assertRaisesRegex(rb.JobRefused, "cannot read"):
+            rb.check(unreadable)
+
+
 class Refused(RedisCase):
     """Anything that can write to Redis must not be able to run code in a worker."""
 
@@ -373,6 +419,22 @@ class Refused(RedisCase):
             rb.JOB_FUNC, {"kind": "convert", "conversion_id": "x"},
             on_failure=Callback("test_redis_backends.canary"),
             on_success=Callback("test_redis_backends.canary"))
+        self.assert_refused("convert.markitdown")
+
+    def test_the_right_function_depending_on_another_job(self):
+        q = Queue("convert.markitdown", connection=self.conn, serializer=JSONSerializer)
+        first = q.enqueue(rb.JOB_FUNC, {"kind": "convert", "conversion_id": "x"})
+        q.enqueue(rb.JOB_FUNC, {"kind": "convert", "conversion_id": "y"}, depends_on=first)
+        self.work(self.service, ["convert.markitdown"])
+        failed = FailedJobRegistry("convert.markitdown", connection=self.conn, serializer=JSONSerializer)
+        self.assertEqual(len(failed.get_job_ids()), 1)
+        (refused,) = [Job.fetch(i, connection=self.conn, serializer=JSONSerializer) for i in failed.get_job_ids()]
+        self.assertEqual(refused.args[0]["conversion_id"], "y")
+        self.assertIn("depends on other jobs", refused.latest_result().exc_string)
+
+    def test_the_right_function_with_two_job_dicts(self):
+        Queue("convert.markitdown", connection=self.conn, serializer=JSONSerializer) \
+            .enqueue(rb.JOB_FUNC, {"kind": "remove", "document_id": "a"}, {"kind": "remove", "document_id": "b"})
         self.assert_refused("convert.markitdown")
 
     def test_the_right_function_with_the_wrong_arguments(self):

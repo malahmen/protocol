@@ -175,7 +175,7 @@ A history prune deletes `superseded` outputs (and `alternative` ones, unless kep
 
 ### The completion stream
 
-Each finished job appends one event (Redis Stream `conversions.events`, once the adapter exists):
+Each finished job appends one event to the Redis Stream `conversions.events`:
 
 ```json
 {"event": "conversion", "document_id": "...", "conversion_id": "...", "state": "validation_pending",
@@ -185,7 +185,9 @@ Each finished job appends one event (Redis Stream `conversions.events`, once the
 {"event": "pruned", "document_id": "...", "conversion_ids": ["..."]}
 ```
 
-`previous_conversion_id` is there for the ingestion side: ingest the new points first, then remove the old ones, so a search never sees a gap.
+`previous_conversion_id` is there for the ingestion side: ingest the new points first, then remove the old ones, so a search never sees a gap. It is never the event's own `conversion_id`.
+
+**Delivery is at-least-once: dedupe on `conversion_id`** (on `document_id` for `removed`). An event is sent after the work it announces, and a job that fails before its event got out - the stream unreachable for a moment - runs again and sends it again; so does any later delivery of a job that already finished. A consumer must treat a second event for the same conversion as the same news. A conversion's event is sent again only while it is still what it announced (current, or an alternative not pruned); one superseded since is announced by its successor's `previous_conversion_id` instead.
 
 ### Where things are kept
 
@@ -216,7 +218,7 @@ Removal runs **index, then outputs, then source**, so a removal that stops halfw
 | `PROTOCOL_JOB_TIMEOUT_PER_PAGE` | `180` | per page: ~3x OCR's measured 54.7 s/page |
 | `PROTOCOL_JOB_TIMEOUT_UNKNOWN` | `21600` | a job whose page count cannot be known (6 h) |
 | `PROTOCOL_JOB_TIMEOUT_PER_AUDIO_MINUTE` | `18` | per minute of audio: ~3x Whisper's measured 0.094 s/s |
-| `SPEACHES_URL` | unset | set: audio is accepted and transcribed by Speaches there (`http://192.168.3.46:8000` on corelia). Needed by the API (to accept audio) and the transcription worker |
+| `SPEACHES_URL` | unset | set: audio is accepted and transcribed by Speaches there (`http://host.containers.internal:8000` on corelia: the LAN address is refused from a rootless container). Needed by the API (to accept audio) and the transcription worker |
 | `SPEACHES_MODEL` | `deepdml/faster-whisper-large-v3-turbo-ct2` | the model used when a request names none |
 | `SPEACHES_API_KEY` | unset | sent as a bearer token, if Speaches was started with one |
 
@@ -250,8 +252,8 @@ protocol/
   service.py    the contract: the requests the API makes, the jobs workers run
   worker.py     one job -> one handler
   api.py        the HTTP endpoints
-  cost.py       a marker job's estimated cost: its lane and its timeout
-  converters.py marker and markitdown, through protocol-droid's images
+  cost.py       a job's estimated cost - a PDF's pages, a recording's length: its lane and its timeout
+  converters.py marker and markitdown, through protocol-droid's images; transcription, through Speaches
   memory.py     in-memory backends, for the tests and the dev server
   redis_backends.py  the queue and the completion stream on Redis; the guarded worker
   s3_store.py   the source and output stores on Garage (S3)
@@ -270,7 +272,7 @@ The contract talks to its backends only through `ports.py`. That is what let it 
 Rules the code keeps, each from the specification:
 
 - **Jobs are data, never code.** RQ pickles whatever callable it is given, so anything that can write to the queue could run code in a worker. Jobs here are plain dicts naming a kind and an ID; the worker already knows the handler.
-- **At-least-once.** A job may run twice. A conversion writes only under its own folder and clears it first, so a second run overwrites its own first attempt and nothing else.
+- **At-least-once.** A job may run twice, one run after the other or both at once. A conversion writes only under its own folder and clears it first. Each run claims the next attempt in the registry with a compare-and-set, and only the run holding the latest attempt writes outputs, records a result or applies the mode; one that lost its attempt to a later run stops without touching anything. Finishing - the mode, the document's pointer, a replaced output's deletion, the event - is idempotent and runs again on any later delivery, in an order that never leaves the document pointing at a deleted output. A registry save never brings back a document whose removal has started, and never clears a conversion's `deleted_at`.
 - **A dead worker's job is not lost.** A worker killed holding a job (a restart, a reboot, the OOM killer) never reaches the service's error handling, and RQ would only fail the job once its timeout ran out, hours later for a big PDF, without telling protocol. Each worker keeps a short-lived key alive in Redis from a thread; between jobs, every worker sweeps every lane for a job in progress whose worker's key has gone, and hands it back to the service. The lost run counts as a failed attempt, so a source that kills its worker every time is dead-lettered after `PROTOCOL_MAX_ATTEMPTS` instead of looping. Recovery takes about two minutes (`redis_backends.py`).
 - **Trouble around a conversion is retried, then parked.** A job that fails outside the converter - the registry, the store, the index or the queue unreachable for a moment - is queued again after 30 s, doubling, up to six times, then dead-lettered with the reason, so nothing is left `converting` or `removal_pending` with no job. A recovered removal or prune counts its lost runs like a conversion's attempts, and a recovered job is never recovered twice.
 - **The record's ID, not the request's.** A job acts on the document ID the registry holds: MariaDB's collation ignores trailing spaces, and a removal by "<id> " once deleted the source while leaving outputs and vectors behind.
@@ -281,9 +283,10 @@ Rules the code keeps, each from the specification:
 
 Each of these is a decision in the specification, not a gap in the code:
 
-- **"Succeeded" means converted, for now.** The specification says a *failed or rejected* reconversion touches nothing. Modes act when the conversion succeeds; if review must approve it first, the same step (`_apply_mode`) moves to the acceptance.
-- **The registry schema** (To decide 8), **the removal states** (9) and **the ingestion format** (2) - the code follows the sketch and names it where it deviates (`contract.py`).
+- **"Succeeded" means converted, for now.** The specification says a *failed or rejected* reconversion touches nothing. Modes act when the conversion succeeds; if review must approve it first, the same step (`_finish`) moves to the acceptance.
 - **Not built:** pre-signed uploads straight into the source store, webhooks (allowlisted targets only, when they come), and the retention rule for history.
+
+Decided since (2026-10-16), and built as decided: the registry schema is `contract.py`'s two records (To decide 8), the removal states are `removal_pending` -> `removed` (9), and the ingestion format is Markdown (2).
 
 ---
 
@@ -292,7 +295,7 @@ Each of these is a decision in the specification, not a gap in the code:
 - **[protocol-droid](https://github.com/malahmen/protocol-droid)** - the marker and markitdown engine. Its worker image becomes this service's marker worker; its provenance and option rules are the models for the ones here.
 - **[holo-convert](https://github.com/malahmen/holo-convert)** - the other direction: Markdown to PDF and DOCX.
 - **[Speaches](https://speaches.ai/)** - the speech server on corelia that the transcription converter calls.
-- **[scomp-link](https://github.com/malahmen/scomp-link)** - where the scripts that install and manage this on corelia will live.
+- **[scomp-link](https://github.com/malahmen/scomp-link)** - where the script that installs and manages this on corelia lives (`protocol.sh`).
 
 ## License
 

@@ -93,6 +93,7 @@ SCHEMA = (
         finished_at    DATETIME(6)     NULL,
         error          TEXT            NULL,
         deleted_at     DATETIME(6)     NULL,
+        previous_conversion_id VARCHAR(64) NULL,
         PRIMARY KEY (conversion_id),
         UNIQUE KEY seq (seq),
         KEY document_created (document_id, created_at, seq),
@@ -100,13 +101,16 @@ SCHEMA = (
             REFERENCES documents (document_id)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin
     """,
+    # Added after the first install (Kamino item 166): a table made before it
+    # gains the column when the API next starts, which applies SCHEMA.
+    "ALTER TABLE conversions ADD COLUMN IF NOT EXISTS previous_conversion_id VARCHAR(64) NULL",
 )
 
 _DOC_FIELDS = ("document_id", "content_hash", "original_name", "media_type", "size", "source_key",
                "submitted_at", "submitted_by", "state", "current_conversion_id", "removed_at")
 _CONV_FIELDS = ("conversion_id", "document_id", "mode", "converter", "options", "state", "role",
                 "output_key", "tool_versions", "attempts", "created_at", "started_at",
-                "finished_at", "error", "deleted_at")
+                "finished_at", "error", "deleted_at", "previous_conversion_id")
 _JSON_FIELDS = ("options", "tool_versions")
 
 
@@ -144,9 +148,19 @@ _CONV_COLS = ", ".join(_CONV_FIELDS)
 _INSERT_DOC = f"INSERT INTO documents ({_DOC_COLS}) VALUES ({', '.join(['%s'] * len(_DOC_FIELDS))})"
 _UPDATE_DOC = (f"UPDATE documents SET {', '.join(f'{f} = %s' for f in _DOC_FIELDS[1:])} "
                "WHERE document_id = %s")
+_LIVE_DOC = f"document_id = %s AND state NOT IN {_NOT_LIVE} AND current_conversion_id <=> %s"
+_UPDATE_LIVE_DOC = _UPDATE_DOC.replace("WHERE document_id = %s", "WHERE " + _LIVE_DOC)
 # Safe as an upsert: a conversion's only unique keys are its ID and `seq`,
 # which an insert never names. A document's is not - see save_document.
-_SAVE_CONV = _upsert("conversions", _CONV_FIELDS)
+# A stored deleted_at is never cleared: a stale copy saved over a removal's
+# or a prune's mark must not undo it (Kamino item 188).
+_SAVE_CONV = _upsert("conversions", _CONV_FIELDS).replace(
+    "deleted_at = VALUES(deleted_at)", "deleted_at = COALESCE(deleted_at, VALUES(deleted_at))")
+_CONV_IF = "conversion_id = %s AND state = %s AND attempts = %s"
+_UPDATE_CONV_IF = ("UPDATE conversions SET "
+                   + ", ".join("deleted_at = COALESCE(deleted_at, %s)" if f == "deleted_at" else f"{f} = %s"
+                               for f in _CONV_FIELDS[1:])
+                   + " WHERE " + _CONV_IF)
 
 
 def connect(host: Optional[str] = None, port: Optional[int] = None, user: Optional[str] = None,
@@ -254,6 +268,21 @@ class MariaDBRegistry:
             else:
                 cur.execute(_INSERT_DOC, values)
 
+    def save_live_document(self, doc: c.Document, expect_current: Optional[str]) -> bool:
+        values = _row(doc, _DOC_FIELDS)
+        where = (doc.document_id, expect_current)
+        return self._update_if(_UPDATE_LIVE_DOC, values[1:] + where, "documents", _LIVE_DOC, where)
+
+    def _update_if(self, update: str, args, table: str, where: str, where_args) -> bool:
+        """A conditional UPDATE: True if its condition held. MariaDB counts
+        changed rows, not matched ones, so a write that changed nothing is
+        told from one that matched nothing by asking again."""
+        with self._cursor() as cur:
+            if cur.execute(update, args):
+                return True
+            cur.execute(f"SELECT 1 FROM {table} WHERE {where}", where_args)
+            return cur.fetchone() is not None
+
     # --- conversions ---------------------------------------------------------
 
     def add_conversion(self, conv: c.Conversion) -> None:
@@ -266,6 +295,11 @@ class MariaDBRegistry:
     def save_conversion(self, conv: c.Conversion) -> None:
         with self._cursor() as cur:
             cur.execute(_SAVE_CONV, _row(conv, _CONV_FIELDS))
+
+    def update_conversion_if(self, conv: c.Conversion, state: str, attempts: int) -> bool:
+        values = _row(conv, _CONV_FIELDS)
+        where = (conv.conversion_id, state, attempts)
+        return self._update_if(_UPDATE_CONV_IF, values[1:] + where, "conversions", _CONV_IF, where)
 
     def conversions_of(self, document_id: str) -> list[c.Conversion]:
         with self._cursor() as cur:
