@@ -198,7 +198,8 @@ class ThroughTheService(RedisCase):
     def test_a_job_that_fails_outside_the_converter_every_time_is_dead_lettered(self):
         service, parts, _ = self.build(self._no_delay())
         doc, conv, _ = service.submit(b"PK", "notes.docx")
-        parts["registry"].save_conversion = mock.Mock(side_effect=ConnectionError("mariadb down"))
+        down = mock.Mock(side_effect=ConnectionError("mariadb down"))
+        parts["registry"].save_conversion = parts["registry"].update_conversion_if = down
         self.work(service, routing.worker_queues("markitdown"))
         (dead,) = self.queue.dead_letters("convert.markitdown")
         self.assertIn("gave up after 6 retries: ConnectionError: mariadb down", dead["reason"])

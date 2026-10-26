@@ -1,3 +1,4 @@
+import dataclasses
 import json
 import unittest
 
@@ -338,10 +339,8 @@ class Blip(ConnectionError):
     """A backend unreachable for a moment."""
 
 
-class FinishTest(Base):
-    """Kamino item 166: finishing a conversion - the mode, the document's
-    pointer, a replaced output, the event - is run again by the job's retry,
-    and a document never points at a deleted output."""
+class Finishing(Base):
+    """A converted document, and ways to break what follows."""
 
     def setUp(self):
         super().setUp()
@@ -353,16 +352,21 @@ class FinishTest(Base):
         conv = self.service.reconvert(self.doc_id, mode)
         return conv, self.queue.pop_any()
 
-    def fail_once(self, obj, method, when=lambda *a: True, exc=Blip):
-        real, state = getattr(obj, method), {"done": False}
+    def fail_once(self, obj, methods, when=lambda *a: True, exc=Blip):
+        """Make the first call to any of `methods` for which `when` holds raise."""
+        state = {"done": False}
+        for method in methods.split():
+            if not hasattr(obj, method):
+                continue            # an older registry without it
+            real = getattr(obj, method)
 
-        def flaky(*args):
-            if not state["done"] and when(*args):
-                state["done"] = True
-                raise exc(f"{method} blip")
-            return real(*args)
-        setattr(obj, method, flaky)
-        self.addCleanup(setattr, obj, method, real)
+            def flaky(*args, real=real, method=method):
+                if not state["done"] and when(*args):
+                    state["done"] = True
+                    raise exc(f"{method} blip")
+                return real(*args)
+            setattr(obj, method, flaky)
+            self.addCleanup(setattr, obj, method, real)
         return state
 
     def assert_points_at_its_output(self):
@@ -372,13 +376,19 @@ class FinishTest(Base):
                         f"the document points at {doc.current_conversion_id}, which has no output")
         return doc
 
+
+class FinishTest(Finishing):
+    """Kamino item 166: finishing a conversion - the mode, the document's
+    pointer, a replaced output, the event - is run again by the job's retry,
+    and a document never points at a deleted output."""
+
     def test_a_registry_blip_while_pointing_the_document_is_repaired_by_the_retry(self):
         for mode, old_role in ((c.REPLACE, c.REPLACED), (c.UPDATE, c.SUPERSEDED)):
             with self.subTest(mode=mode):
                 old = self.registry.get_document(self.doc_id).current_conversion_id
                 conv, job = self.queued_reconversion(mode)
-                self.fail_once(self.registry, "save_document",
-                               lambda d: d.current_conversion_id == conv.conversion_id)
+                self.fail_once(self.registry, "save_document save_live_document",
+                               lambda d, *_: d.current_conversion_id == conv.conversion_id)
                 with self.assertRaises(Blip):
                     handle(self.service, job)
                 self.assert_points_at_its_output()           # the old one, still whole
@@ -397,7 +407,9 @@ class FinishTest(Base):
         the worker would. Whichever call failed, the document never points at
         a deleted output, and ends on the new conversion with it announced."""
         calls = [("registry", m) for m in ("get_document", "get_conversion", "save_document",
-                                            "save_conversion")]
+                                            "save_live_document", "save_conversion",
+                                            "update_conversion_if")
+                 if hasattr(self.registry, m)]
         calls += [("store", m) for m in ("delete_prefix", "put")]
         calls += [("events", "append")]
         for which, method in calls:
@@ -426,8 +438,8 @@ class FinishTest(Base):
 
     def test_a_worker_killed_while_finishing_is_finished_by_its_recovery(self):
         conv, job = self.queued_reconversion(c.REPLACE)
-        self.fail_once(self.registry, "save_document",
-                       lambda d: d.current_conversion_id == conv.conversion_id, exc=Died)
+        self.fail_once(self.registry, "save_document save_live_document",
+                       lambda d, *_: d.current_conversion_id == conv.conversion_id, exc=Died)
         with self.assertRaises(Died):
             handle(self.service, job)
         recover(self.service, job)
@@ -454,6 +466,110 @@ class FinishTest(Base):
         doc = self.assert_points_at_its_output()
         self.assertEqual(doc.current_conversion_id, third.conversion_id)
         self.assertEqual(len(self.events), before)
+
+
+class AtLeastOnceTest(Finishing):
+    """Kamino item 188: a job delivered twice - one after a stream error, or
+    two at once - announces everything at least once and undoes nothing."""
+
+    def overlapping(self, mode):
+        """A second delivery of the same job runs, start to end, while the
+        first is inside its converter (a retry beside a worker taken for dead)."""
+        conv, job = self.queued_reconversion(mode)
+        nested = {"done": False}
+
+        def second_delivery():
+            if not nested["done"]:
+                nested["done"] = True
+                handle(self.service, job)
+        self.converters["marker"].on_convert = second_delivery
+        handle(self.service, job)
+        self.converters["marker"].on_convert = None
+        return conv
+
+    def test_overlapping_deliveries_of_a_replace_keep_its_output(self):
+        conv = self.overlapping(c.REPLACE)
+        doc = self.assert_points_at_its_output()
+        self.assertEqual(doc.current_conversion_id, conv.conversion_id)
+        self.assertEqual(self.store.list(c.output_prefix(self.doc_id, self.first.conversion_id)), [])
+
+    def test_overlapping_deliveries_of_an_update_never_name_it_as_its_own_previous(self):
+        conv = self.overlapping(c.UPDATE)
+        events = [e for e in self.events if e.get("conversion_id") == conv.conversion_id]
+        self.assertEqual([e["previous_conversion_id"] for e in events], [self.first.conversion_id])
+        roles = {cv.conversion_id: cv.role for cv in self.registry.conversions_of(self.doc_id)}
+        self.assertEqual((roles[conv.conversion_id], roles[self.first.conversion_id]),
+                         (c.CURRENT, c.SUPERSEDED))
+
+    def test_the_delivery_that_lost_its_attempt_records_nothing_when_it_fails(self):
+        conv, job = self.queued_reconversion(c.UPDATE)
+        nested = {"done": False}
+
+        def second_delivery_then_fail():
+            if not nested["done"]:
+                nested["done"] = True
+                handle(self.service, job)            # this one converts and finishes
+                raise RuntimeError("the first delivery's converter fails afterwards")
+        self.converters["marker"].on_convert = second_delivery_then_fail
+        handle(self.service, job)
+        stored = self.registry.get_conversion(conv.conversion_id)
+        self.assertEqual((stored.state, stored.error), (c.VALIDATION_PENDING, None))
+        self.assert_points_at_its_output()
+        self.assertEqual(self.queue.depth(routing.MARKER_HEAVY_QUEUE), 0)   # no retry queued
+
+    def test_a_failure_event_lost_to_a_stream_blip_is_sent_on_the_retry(self):
+        self.converters["marker"].fail_times = 99
+        conv, job = self.queued_reconversion(c.UPDATE)
+        self.service.settings = dataclasses.replace(self.service.settings, max_attempts=1)
+        self.fail_once(self.parts["events"], "append")
+        with self.assertRaises(Blip):
+            handle(self.service, job)
+        handle(self.service, job)
+        events = [e for e in self.events if e.get("conversion_id") == conv.conversion_id]
+        self.assertEqual([e["state"] for e in events], [c.CONVERSION_FAILED])
+        self.assertEqual(len(self.queue.dead), 1)
+
+    def test_a_removal_event_lost_to_a_stream_blip_is_sent_on_the_retry(self):
+        self.fail_once(self.parts["events"], "append")
+        self.service.remove(self.doc_id)
+        job = self.queue.pop_any()
+        with self.assertRaises(Blip):
+            handle(self.service, job)
+        handle(self.service, job)
+        self.assertEqual(self.registry.get_document(self.doc_id).state, c.REMOVED)
+        self.assertEqual([e for e in self.events if e["event"] == c.EVENT_REMOVED],
+                         [{"event": c.EVENT_REMOVED, "document_id": self.doc_id}])
+
+    def test_a_removal_that_completes_while_a_conversion_finishes_stays_complete(self):
+        conv, job = self.queued_reconversion(c.UPDATE)
+        real, ran = self.registry.save_conversion, {"done": False}
+
+        def remove_meanwhile(cv):
+            real(cv)
+            if cv.role == c.SUPERSEDED and not ran["done"]:     # finishing, before the pointer
+                ran["done"] = True
+                self.service.remove(self.doc_id)
+                self.service.run_removal(self.doc_id)
+        self.registry.save_conversion = remove_meanwhile
+        self.addCleanup(setattr, self.registry, "save_conversion", real)
+        handle(self.service, job)
+        self.assertTrue(ran["done"])
+        doc = self.registry.get_document(self.doc_id)
+        self.assertEqual((doc.state, doc.current_conversion_id, doc.source_key), (c.REMOVED, None, None))
+        self.assertEqual(self.store.list(""), [])
+
+    def test_a_conversion_failing_after_its_document_was_removed_keeps_its_deletion(self):
+        def remove_meanwhile():
+            self.service.remove(self.doc_id)
+            self.service.run_removal(self.doc_id)
+        self.converters["marker"].on_convert = remove_meanwhile
+        self.converters["marker"].fail_times = 1
+        conv, job = self.queued_reconversion(c.UPDATE)
+        handle(self.service, job)
+        drain(self.service, self.queue)
+        for cv in self.registry.conversions_of(self.doc_id):
+            self.assertIsNotNone(cv.deleted_at, f"{cv.conversion_id} ({cv.state}) lost its deleted_at")
+        self.assertEqual(self.registry.get_document(self.doc_id).state, c.REMOVED)
 
 
 class RemovalTest(Base):

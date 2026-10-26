@@ -208,8 +208,17 @@ class ConversionService:
         if doc.state == c.REMOVAL_PENDING:
             self.queue.enqueue(routing.MAINTENANCE_QUEUE, {"kind": "remove", "document_id": doc.document_id})
             return doc
-        doc.state = c.REMOVAL_PENDING
-        self.registry.save_document(doc)
+        for _ in range(5):
+            pointer = doc.current_conversion_id
+            doc.state = c.REMOVAL_PENDING
+            if self.registry.save_live_document(doc, pointer):
+                break
+            # A conversion finished meanwhile, or another removal started.
+            doc = self._known(document_id)
+            if not doc.live:
+                return self.remove(document_id)
+        else:
+            raise RuntimeError(f"document {doc.document_id}: its pointer kept moving")
         self.queue.enqueue(routing.MAINTENANCE_QUEUE, {"kind": "remove", "document_id": doc.document_id})
         return doc
 
@@ -223,16 +232,20 @@ class ConversionService:
 
     def run_conversion(self, conversion_id: str) -> None:
         conv = self.registry.get_conversion(conversion_id)
-        if conv is None or conv.state == c.CONVERSION_FAILED:
-            return  # unknown, or already failed by an earlier delivery
+        if conv is None:
+            return
+        # Finished by an earlier delivery, which may have stopped before its
+        # last step - the document's pointer, the event: finish it again.
         if conv.state == c.VALIDATION_PENDING:
-            # Converted by an earlier delivery, which may have stopped before
-            # the document pointed at it or before the event: finish it.
             self._finish(conv.conversion_id)
             return
+        if conv.state == c.CONVERSION_FAILED:
+            self._settle_failure(conv)
+            return
+        found = (conv.state, conv.attempts)
         doc = self.registry.get_document(conv.document_id)
         if doc is None or not doc.live:
-            self._fail(conv, doc, "document removed before conversion")
+            self._fail(conv, found, "document removed before conversion")
             return
 
         prefix = c.output_prefix(doc.document_id, conv.conversion_id)
@@ -240,20 +253,30 @@ class ConversionService:
         conv.attempts += 1
         conv.started_at = c.now()
         conv.error = None
-        self.registry.save_conversion(conv)
+        # This delivery owns the attempt it claims here, and only while the
+        # registry still shows it (Kamino item 188): a second delivery of the
+        # same job - a retry beside a worker taken for dead - claims the next
+        # attempt, and from then on the first one writes nothing.
+        if not self.registry.update_conversion_if(conv, *found):
+            return
+        mine = (c.CONVERTING, conv.attempts)
         if doc.current_conversion_id is None and doc.state != c.CONVERTING:
             doc.state = c.CONVERTING
-            self.registry.save_document(doc)
+            self.registry.save_live_document(doc, None)
 
         data = None
         try:
             converter = self.converters[conv.converter]
             data = self.store.get(doc.source_key)
             result = converter.convert(data, doc.original_name, conv.options)
+            if not self._owns(conv.conversion_id, mine):
+                return                         # taken over while converting: its output, not ours
             self.store.delete_prefix(prefix)   # at-least-once: clear an earlier attempt
             for name, content in result.files.items():
                 self.store.put(prefix + _safe_relative(name), content)
         except Exception as exc:  # noqa: BLE001 - every failure is recorded, then retried or parked
+            if not self._owns(conv.conversion_id, mine):
+                return
             self.store.delete_prefix(prefix)
             reason = f"{type(exc).__name__}: {exc}"
             if isinstance(exc, ConversionTimeout):
@@ -261,9 +284,9 @@ class ConversionService:
                 # rate, so a run that used it all was misjudged or stuck, and
                 # a retry would hold the lane as long again. A reconversion
                 # with a page range, or a larger allowance, is the way back.
-                self._fail(conv, doc, reason + " (a timeout is final; not retried)")
+                self._fail(conv, mine, reason + " (a timeout is final; not retried)")
             else:
-                self._attempt_failed(conv, doc, data, reason)
+                self._attempt_failed(conv, mine, doc, data, reason)
             return
 
         conv.tool_versions = dict(result.tool_versions)
@@ -274,7 +297,7 @@ class ConversionService:
         doc = self.registry.get_document(doc.document_id)
         if doc is None or not doc.live:
             self.store.delete_prefix(prefix)
-            self._fail(conv, doc, "document removed while converting")
+            self._fail(conv, mine, "document removed while converting")
             return
 
         # Decision 13: the mode acts now that the conversion has succeeded.
@@ -290,8 +313,14 @@ class ConversionService:
             conv.role, conv.previous_conversion_id = c.ALTERNATIVE, None
         else:
             conv.role, conv.previous_conversion_id = c.CURRENT, current
-        self.registry.save_conversion(conv)
+        if not self.registry.update_conversion_if(conv, *mine):
+            return                     # another delivery took the attempt over: it finishes
         self._finish(conv.conversion_id)
+
+    def _owns(self, conversion_id: str, mine: tuple[str, int]) -> bool:
+        """Is the attempt this delivery claimed still the conversion's?"""
+        stored = self.registry.get_conversion(conversion_id)
+        return stored is not None and (stored.state, stored.attempts) == mine
 
     def recover_conversion(self, conversion_id: str) -> None:
         """A conversion whose worker died while it held the job (Kamino item 87).
@@ -303,16 +332,21 @@ class ConversionService:
         the converter would be; so a source that kills its worker every time
         is dead-lettered after PROTOCOL_MAX_ATTEMPTS, not retried for ever.
         One the worker had taken but not yet started is queued again as it was.
+        One that had finished converting is finished (_finish).
         """
         conv = self.registry.get_conversion(conversion_id)
-        if conv is None or conv.state == c.CONVERSION_FAILED:
-            return  # unknown, or failed before the worker died
-        if conv.state == c.VALIDATION_PENDING:
-            self._finish(conv.conversion_id)   # converted; the worker may have died finishing it
+        if conv is None:
             return
+        if conv.state == c.VALIDATION_PENDING:
+            self._finish(conv.conversion_id)   # the worker may have died finishing it
+            return
+        if conv.state == c.CONVERSION_FAILED:
+            self._settle_failure(conv)
+            return
+        found = (conv.state, conv.attempts)
         doc = self.registry.get_document(conv.document_id)
         if doc is None or not doc.live:
-            self._fail(conv, doc, "document removed before conversion")
+            self._fail(conv, found, "document removed before conversion")
             return
         # Only marker's lane depends on the source (_plan), so only marker reads it.
         data = self.store.get(doc.source_key) if conv.converter == "marker" else None
@@ -322,22 +356,25 @@ class ConversionService:
                                timeout_seconds=timeout)
             return
         self.store.delete_prefix(c.output_prefix(doc.document_id, conv.conversion_id))
-        self._attempt_failed(conv, doc, data, f"worker died during attempt {conv.attempts}")
+        self._attempt_failed(conv, found, doc, data, f"worker died during attempt {conv.attempts}")
 
-    def _attempt_failed(self, conv: c.Conversion, doc: c.Document, data: Optional[bytes],
-                        reason: str) -> None:
-        """Retry after a delay that doubles per attempt, or park it once out of attempts."""
+    def _attempt_failed(self, conv: c.Conversion, mine: tuple[str, int], doc: c.Document,
+                        data: Optional[bytes], reason: str) -> None:
+        """Retry after a delay that doubles per attempt, or park it once out of attempts.
+
+        `mine`: the state and attempt count the registry must still show."""
         reason = reason[:1000]
         if conv.attempts < self.settings.max_attempts:
             conv.state = c.CONVERSION_PENDING
             conv.error = reason
-            self.registry.save_conversion(conv)
+            if not self.registry.update_conversion_if(conv, *mine):
+                return
             delay = self.settings.retry_base_seconds * 2 ** (conv.attempts - 1)
             queue, timeout = self._plan(conv.converter, doc.original_name, data, conv.options)
             self.queue.enqueue(queue, {"kind": "convert", "conversion_id": conv.conversion_id},
                                delay, timeout_seconds=timeout)
         else:
-            self._fail(conv, doc, reason)
+            self._fail(conv, mine, reason)
 
     def _finish(self, conversion_id: str) -> None:
         """Make a converted conversion's mode take effect, then announce it.
@@ -359,11 +396,19 @@ class ConversionService:
         ingestion side can ingest the new points and then remove the old
         ones - "ingest new, then remove old", so a search never sees a gap.
         """
-        conv = self.registry.get_conversion(conversion_id)
-        doc = self.registry.get_document(conv.document_id)
-        if doc is None or not doc.live:
-            return            # being removed: the removal deletes the outputs and says so
-        if conv.role == c.CURRENT and doc.current_conversion_id != conv.conversion_id:
+        for _ in range(5):
+            conv = self.registry.get_conversion(conversion_id)
+            doc = self.registry.get_document(conv.document_id)
+            if doc is None or not doc.live:
+                # Removed meanwhile - perhaps after the cascade deleted the
+                # outputs: this one's go too, and the removal is the event.
+                self.store.delete_prefix(c.output_prefix(conv.document_id, conv.conversion_id))
+                if conv.deleted_at is None:
+                    conv.deleted_at = c.now()
+                    self.registry.save_conversion(conv)
+                return
+            if conv.role != c.CURRENT or doc.current_conversion_id == conv.conversion_id:
+                break
             if doc.current_conversion_id != conv.previous_conversion_id:
                 # Another conversion became current after this one converted:
                 # this one, finishing later, takes over from that one.
@@ -376,8 +421,12 @@ class ConversionService:
                 self.registry.save_conversion(previous)
             doc.current_conversion_id = conv.conversion_id
             doc.state = conv.state
-            self.registry.save_document(doc)
-        elif conv.role not in (c.CURRENT, c.ALTERNATIVE) or conv.deleted_at is not None:
+            if self.registry.save_live_document(doc, conv.previous_conversion_id):
+                break
+            # Removed, or another conversion took the pointer first: look again.
+        else:
+            raise RuntimeError(f"conversion {conversion_id}: the document's pointer kept moving")
+        if conv.role not in (c.CURRENT, c.ALTERNATIVE) or conv.deleted_at is not None:
             return            # superseded, replaced or pruned since: a later event said so
         previous_id = conv.previous_conversion_id if conv.role == c.CURRENT else None
         if conv.mode == c.REPLACE and previous_id:
@@ -393,23 +442,38 @@ class ConversionService:
                             "output_key": conv.output_key, "mode": conv.mode, "role": conv.role,
                             "previous_conversion_id": previous_id})
 
-    def _fail(self, conv: c.Conversion, doc: Optional[c.Document], reason: str) -> None:
+    def _fail(self, conv: c.Conversion, found: Optional[tuple[str, int]], reason: str) -> None:
+        """Park the conversion as failed - if the registry still shows it as
+        `found` (state, attempts): a delivery that lost its attempt to
+        another records nothing (Kamino item 188)."""
         conv.state = c.CONVERSION_FAILED
         conv.error = reason
         conv.finished_at = c.now()
-        self.registry.save_conversion(conv)
+        if found is not None and not self.registry.update_conversion_if(conv, *found):
+            return
+        self._settle_failure(conv)
+
+    def _settle_failure(self, conv: c.Conversion) -> None:
+        """What follows a failure: the document's state, the event, the dead
+        letter. Run again by a redelivery of a failed job, so a stream or
+        queue error here is retried instead of losing them (item 188)."""
+        doc = self.registry.get_document(conv.document_id)
         # A failed reconversion leaves the document as it was; only a document
         # with nothing current takes the failure as its own state.
-        if doc is not None and doc.live and doc.current_conversion_id is None:
+        if (doc is not None and doc.live and doc.current_conversion_id is None
+                and doc.state != c.CONVERSION_FAILED):
             doc.state = c.CONVERSION_FAILED
-            self.registry.save_document(doc)
-        if doc is not None and doc.live:
-            self.queue.dead_letter(routing.queue_for(conv.converter),
-                                   {"kind": "convert", "conversion_id": conv.conversion_id}, reason)
+            self.registry.save_live_document(doc, None)
         self.events.append({"event": c.EVENT_CONVERSION, "document_id": conv.document_id,
                             "conversion_id": conv.conversion_id, "state": conv.state,
                             "output_key": None, "mode": conv.mode, "role": None,
                             "previous_conversion_id": None})
+        # Last: a redelivery that finds it failed sends the event again (the
+        # stream is at-least-once) but a dead letter only if this one was lost.
+        if doc is not None and doc.live:
+            self.queue.dead_letter(routing.queue_for(conv.converter),
+                                   {"kind": "convert", "conversion_id": conv.conversion_id},
+                                   conv.error or "")
 
     def _provenance(self, doc: c.Document, conv: c.Conversion, files: list[str]) -> bytes:
         record = {
@@ -447,6 +511,10 @@ class ConversionService:
             if conv.deleted_at is None:
                 conv.deleted_at = removed_at
                 self.registry.save_conversion(conv)
+        # Announced before the tombstone is written (Kamino item 188): a
+        # stream error leaves the document removal_pending, and the job's
+        # retry runs the cascade - written to run twice - and announces again.
+        self.events.append({"event": c.EVENT_REMOVED, "document_id": document_id})
         # The tombstone keeps what proves the removal happened - the ID, the
         # content hash and when - and drops the rest, the name included.
         doc.state = c.REMOVED
@@ -456,7 +524,6 @@ class ConversionService:
         doc.current_conversion_id = None
         doc.submitted_by = None
         self.registry.save_document(doc)
-        self.events.append({"event": c.EVENT_REMOVED, "document_id": document_id})
 
     def run_prune(self, document_id: str, keep_alternatives: bool = False) -> None:
         doc = self.registry.get_document(document_id) if is_id(document_id) else None

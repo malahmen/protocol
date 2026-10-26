@@ -211,6 +211,53 @@ class RegistryBehaviour:
         self.assertEqual(len({d.document_id for d, _ in results}), 1)
 
 
+    # Kamino item 188: the conditional saves.
+
+    def test_a_live_save_never_brings_back_a_removed_document(self):
+        for state in (c.REMOVAL_PENDING, c.REMOVED):
+            with self.subTest(state=state):
+                d, _ = self.registry.add_document_if_absent(doc("d-" + state, state[0] * 64))
+                d.state = state
+                self.registry.save_document(d)
+                stale = doc("d-" + state, state[0] * 64, state=c.VALIDATION_PENDING,
+                            current_conversion_id="c1")
+                self.assertFalse(self.registry.save_live_document(stale, None))
+                self.assertEqual(self.registry.get_document("d-" + state).state, state)
+
+    def test_a_live_save_needs_the_pointer_it_expects(self):
+        self.registry.add_document_if_absent(doc("d1", current_conversion_id="c1"))
+        moved = doc("d1", state=c.VALIDATION_PENDING, current_conversion_id="c2")
+        self.assertFalse(self.registry.save_live_document(moved, None))
+        self.assertEqual(self.registry.get_document("d1").current_conversion_id, "c1")
+        self.assertTrue(self.registry.save_live_document(moved, "c1"))
+        self.assertEqual(self.registry.get_document("d1"), moved)
+        self.assertTrue(self.registry.save_live_document(moved, "c2"))      # changing nothing is a yes
+
+    def test_a_conditional_conversion_save_needs_the_state_and_attempts_it_expects(self):
+        self.registry.add_document_if_absent(doc("d1"))
+        self.registry.add_conversion(conv("c1", state=c.CONVERTING, attempts=1))
+        mine = conv("c1", state=c.VALIDATION_PENDING, attempts=1, role=c.CURRENT)
+        self.assertFalse(self.registry.update_conversion_if(mine, c.CONVERTING, 2))
+        self.assertFalse(self.registry.update_conversion_if(mine, c.CONVERSION_PENDING, 1))
+        self.assertEqual(self.registry.get_conversion("c1").state, c.CONVERTING)
+        self.assertTrue(self.registry.update_conversion_if(mine, c.CONVERTING, 1))
+        self.assertEqual(self.registry.get_conversion("c1"), mine)
+        self.assertTrue(self.registry.update_conversion_if(mine, c.VALIDATION_PENDING, 1))
+        self.assertFalse(self.registry.update_conversion_if(conv("c9"), c.CONVERSION_PENDING, 0))
+
+    def test_a_stale_save_never_clears_deleted_at(self):
+        self.registry.add_document_if_absent(doc("d1"))
+        deleted = conv("c1", state=c.CONVERTING, attempts=1, deleted_at=T0)
+        self.registry.add_conversion(deleted)
+        stale = conv("c1", state=c.CONVERSION_PENDING, attempts=1)
+        self.registry.save_conversion(stale)
+        self.assertEqual(self.registry.get_conversion("c1").deleted_at, T0)
+        self.assertEqual(self.registry.get_conversion("c1").state, c.CONVERSION_PENDING)
+        stale.state = c.CONVERSION_FAILED
+        self.assertTrue(self.registry.update_conversion_if(stale, c.CONVERSION_PENDING, 1))
+        self.assertEqual(self.registry.get_conversion("c1").deleted_at, T0)
+
+
 class StoreBehaviour:
     """Every ObjectStore must do this. setUp provides self.store."""
 
@@ -464,7 +511,8 @@ def _on_real_backends(case):
 # bug exists only there.
 for _case in (test_service.SubmitTest, test_service.ConversionTest, test_service.ModesTest,
               test_service.RemovalTest, test_service.PruneTest, test_service.RecoveryTest,
-              test_service.IdTest, test_service.FinishTest):
+              test_service.IdTest, test_service.FinishTest,
+              test_service.AtLeastOnceTest):
     globals()[_case.__name__ + "OnRealBackends"] = _on_real_backends(_case)
 del _case
 

@@ -185,7 +185,9 @@ Each finished job appends one event (Redis Stream `conversions.events`, once the
 {"event": "pruned", "document_id": "...", "conversion_ids": ["..."]}
 ```
 
-`previous_conversion_id` is there for the ingestion side: ingest the new points first, then remove the old ones, so a search never sees a gap.
+`previous_conversion_id` is there for the ingestion side: ingest the new points first, then remove the old ones, so a search never sees a gap. It is never the event's own `conversion_id`.
+
+**Delivery is at-least-once: dedupe on `conversion_id`** (on `document_id` for `removed`). An event is sent after the work it announces, and a job that fails before its event got out - the stream unreachable for a moment - runs again and sends it again; so does any later delivery of a job that already finished. A consumer must treat a second event for the same conversion as the same news. A conversion's event is sent again only while it is still what it announced (current, or an alternative not pruned); one superseded since is announced by its successor's `previous_conversion_id` instead.
 
 ### Where things are kept
 
@@ -270,7 +272,7 @@ The contract talks to its backends only through `ports.py`. That is what let it 
 Rules the code keeps, each from the specification:
 
 - **Jobs are data, never code.** RQ pickles whatever callable it is given, so anything that can write to the queue could run code in a worker. Jobs here are plain dicts naming a kind and an ID; the worker already knows the handler.
-- **At-least-once.** A job may run twice. A conversion writes only under its own folder and clears it first, so a second run overwrites its own first attempt and nothing else.
+- **At-least-once.** A job may run twice, one run after the other or both at once. A conversion writes only under its own folder and clears it first. Each run claims the next attempt in the registry with a compare-and-set, and only the run holding the latest attempt writes outputs, records a result or applies the mode; one that lost its attempt to a later run stops without touching anything. Finishing - the mode, the document's pointer, a replaced output's deletion, the event - is idempotent and runs again on any later delivery, in an order that never leaves the document pointing at a deleted output. A registry save never brings back a document whose removal has started, and never clears a conversion's `deleted_at`.
 - **A dead worker's job is not lost.** A worker killed holding a job (a restart, a reboot, the OOM killer) never reaches the service's error handling, and RQ would only fail the job once its timeout ran out, hours later for a big PDF, without telling protocol. Each worker keeps a short-lived key alive in Redis from a thread; between jobs, every worker sweeps every lane for a job in progress whose worker's key has gone, and hands it back to the service. The lost run counts as a failed attempt, so a source that kills its worker every time is dead-lettered after `PROTOCOL_MAX_ATTEMPTS` instead of looping. Recovery takes about two minutes (`redis_backends.py`).
 - **Trouble around a conversion is retried, then parked.** A job that fails outside the converter - the registry, the store, the index or the queue unreachable for a moment - is queued again after 30 s, doubling, up to six times, then dead-lettered with the reason, so nothing is left `converting` or `removal_pending` with no job. A recovered removal or prune counts its lost runs like a conversion's attempts, and a recovered job is never recovered twice.
 - **The record's ID, not the request's.** A job acts on the document ID the registry holds: MariaDB's collation ignores trailing spaces, and a removal by "<id> " once deleted the source while leaving outputs and vectors behind.

@@ -148,9 +148,19 @@ _CONV_COLS = ", ".join(_CONV_FIELDS)
 _INSERT_DOC = f"INSERT INTO documents ({_DOC_COLS}) VALUES ({', '.join(['%s'] * len(_DOC_FIELDS))})"
 _UPDATE_DOC = (f"UPDATE documents SET {', '.join(f'{f} = %s' for f in _DOC_FIELDS[1:])} "
                "WHERE document_id = %s")
+_LIVE_DOC = f"document_id = %s AND state NOT IN {_NOT_LIVE} AND current_conversion_id <=> %s"
+_UPDATE_LIVE_DOC = _UPDATE_DOC.replace("WHERE document_id = %s", "WHERE " + _LIVE_DOC)
 # Safe as an upsert: a conversion's only unique keys are its ID and `seq`,
 # which an insert never names. A document's is not - see save_document.
-_SAVE_CONV = _upsert("conversions", _CONV_FIELDS)
+# A stored deleted_at is never cleared: a stale copy saved over a removal's
+# or a prune's mark must not undo it (Kamino item 188).
+_SAVE_CONV = _upsert("conversions", _CONV_FIELDS).replace(
+    "deleted_at = VALUES(deleted_at)", "deleted_at = COALESCE(deleted_at, VALUES(deleted_at))")
+_CONV_IF = "conversion_id = %s AND state = %s AND attempts = %s"
+_UPDATE_CONV_IF = ("UPDATE conversions SET "
+                   + ", ".join("deleted_at = COALESCE(deleted_at, %s)" if f == "deleted_at" else f"{f} = %s"
+                               for f in _CONV_FIELDS[1:])
+                   + " WHERE " + _CONV_IF)
 
 
 def connect(host: Optional[str] = None, port: Optional[int] = None, user: Optional[str] = None,
@@ -258,6 +268,21 @@ class MariaDBRegistry:
             else:
                 cur.execute(_INSERT_DOC, values)
 
+    def save_live_document(self, doc: c.Document, expect_current: Optional[str]) -> bool:
+        values = _row(doc, _DOC_FIELDS)
+        where = (doc.document_id, expect_current)
+        return self._update_if(_UPDATE_LIVE_DOC, values[1:] + where, "documents", _LIVE_DOC, where)
+
+    def _update_if(self, update: str, args, table: str, where: str, where_args) -> bool:
+        """A conditional UPDATE: True if its condition held. MariaDB counts
+        changed rows, not matched ones, so a write that changed nothing is
+        told from one that matched nothing by asking again."""
+        with self._cursor() as cur:
+            if cur.execute(update, args):
+                return True
+            cur.execute(f"SELECT 1 FROM {table} WHERE {where}", where_args)
+            return cur.fetchone() is not None
+
     # --- conversions ---------------------------------------------------------
 
     def add_conversion(self, conv: c.Conversion) -> None:
@@ -270,6 +295,11 @@ class MariaDBRegistry:
     def save_conversion(self, conv: c.Conversion) -> None:
         with self._cursor() as cur:
             cur.execute(_SAVE_CONV, _row(conv, _CONV_FIELDS))
+
+    def update_conversion_if(self, conv: c.Conversion, state: str, attempts: int) -> bool:
+        values = _row(conv, _CONV_FIELDS)
+        where = (conv.conversion_id, state, attempts)
+        return self._update_if(_UPDATE_CONV_IF, values[1:] + where, "conversions", _CONV_IF, where)
 
     def conversions_of(self, document_id: str) -> list[c.Conversion]:
         with self._cursor() as cur:

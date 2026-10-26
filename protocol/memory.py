@@ -49,6 +49,14 @@ class Registry:
         with self._lock:
             self.documents[doc.document_id] = copy.deepcopy(doc)
 
+    def save_live_document(self, doc: Document, expect_current: Optional[str]) -> bool:
+        with self._lock:
+            stored = self.documents.get(doc.document_id)
+            if stored is None or not stored.live or stored.current_conversion_id != expect_current:
+                return False
+            self.documents[doc.document_id] = copy.deepcopy(doc)
+            return True
+
     def add_conversion(self, conv: Conversion) -> None:
         with self._lock:
             self.conversions[conv.conversion_id] = copy.deepcopy(conv)
@@ -58,9 +66,24 @@ class Registry:
             conv = self.conversions.get(conversion_id)
             return copy.deepcopy(conv) if conv else None
 
+    def _put_conversion(self, conv: Conversion) -> None:
+        stored = self.conversions.get(conv.conversion_id)
+        conv = copy.deepcopy(conv)
+        if stored is not None and stored.deleted_at is not None:
+            conv.deleted_at = stored.deleted_at       # deleted stays deleted
+        self.conversions[conv.conversion_id] = conv
+
     def save_conversion(self, conv: Conversion) -> None:
         with self._lock:
-            self.conversions[conv.conversion_id] = copy.deepcopy(conv)
+            self._put_conversion(conv)
+
+    def update_conversion_if(self, conv: Conversion, state: str, attempts: int) -> bool:
+        with self._lock:
+            stored = self.conversions.get(conv.conversion_id)
+            if stored is None or (stored.state, stored.attempts) != (state, attempts):
+                return False
+            self._put_conversion(conv)
+            return True
 
     def conversions_of(self, document_id: str) -> list[Conversion]:
         with self._lock:

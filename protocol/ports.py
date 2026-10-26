@@ -35,10 +35,37 @@ class Registry(Protocol):
         ...
 
     def get_document(self, document_id: str) -> Optional[Document]: ...
-    def save_document(self, doc: Document) -> None: ...
+
+    def save_document(self, doc: Document) -> None:
+        """Unconditional: the removal cascade's tombstone, and nothing else."""
+        ...
+
+    def save_live_document(self, doc: Document, expect_current: Optional[str]) -> bool:
+        """Save `doc` only while the stored one is live and still points at
+        `expect_current`; False, writing nothing, otherwise (Kamino item 188).
+
+        So a conversion finishing, or failing, never brings back a document
+        whose removal started or completed meanwhile, and two conversions
+        finishing at once cannot both take the pointer.
+        """
+        ...
+
     def add_conversion(self, conv: Conversion) -> None: ...
     def get_conversion(self, conversion_id: str) -> Optional[Conversion]: ...
-    def save_conversion(self, conv: Conversion) -> None: ...
+
+    def save_conversion(self, conv: Conversion) -> None:
+        """Never clears a stored `deleted_at`: what is deleted stays deleted,
+        whatever stale copy is saved over it."""
+        ...
+
+    def update_conversion_if(self, conv: Conversion, state: str, attempts: int) -> bool:
+        """Save `conv` only if the stored one is still in `state` after
+        `attempts` attempts; False, writing nothing, otherwise. The
+        compare-and-set that makes one delivery of a job the owner of its
+        attempt (Kamino item 188). Like save_conversion, never clears
+        `deleted_at`."""
+        ...
+
     def conversions_of(self, document_id: str) -> list[Conversion]: ...
 
 
